@@ -1,0 +1,15 @@
+transformers>=4.44.0
+accelerate>=0.30.0
+torch>=2.2.0
+peft>=0.11.0
+huggingface_hub
+sentencepiece
+datasets
+scikit-learn
+pandas
+numpy
+tqdm
+PyYAML
+rich
+socksio
+httpx[socks]

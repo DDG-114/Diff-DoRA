@@ -1,0 +1,25 @@
+base_model: models/Qwen2.5-1.5B-Instruct
+dataset: st_evcdp
+horizon: 6
+history_len: 12
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  use_dora: true          # DoRA enabled
+train:
+  epochs: 3
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  fp16: true
+routing:
+  method: hard            # hard label routing
+  n_experts: 2
+retrieval:
+  top_k: 2
+diff_dora:
+  input_dim: 3            # [diff_occ, diff_temp, diff_price]
+  hidden_dim: 32
+  scale: 0.5
+output_dir: outputs/moe_diff_dora_h6
