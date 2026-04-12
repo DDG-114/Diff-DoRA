@@ -119,7 +119,7 @@ def evaluate_one_expert(
     for s in test_samples[:args.eval_max_samples]:
         for n in nodes[:args.eval_nodes_per_expert]:
             if args.use_rag and retriever is not None:
-                retrieved = retriever.query(s, exclude_t_start=s.get("t_start"))
+                retrieved = retriever.query(s, exclude_t_start=None)
                 diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
                 sys_msg, usr_msg = build_cot_prompt(s, retrieved, diff, n, args.horizon)
             else:

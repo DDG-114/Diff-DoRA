@@ -93,7 +93,7 @@ def main():
     for idx, sample in enumerate(subset):
         sample_node_idx = int(sample.get("node_idx", args.node_idx))
         if args.use_rag and retriever is not None:
-            retrieved = retriever.query(sample, exclude_t_start=sample.get("t_start"))
+            retrieved = retriever.query(sample, exclude_t_start=None)
             diff = compute_diff_features(query_sample=sample, retrieved_samples=retrieved)
             sys_msg, usr_msg = build_cot_prompt(sample, retrieved, diff, sample_node_idx, args.horizon)
         else:

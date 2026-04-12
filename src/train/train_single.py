@@ -223,7 +223,7 @@ def run_inference(
     for s in subset:
         sample_node_idx = int(s.get("node_idx", node_idx))
         if use_rag and retriever is not None:
-            retrieved = retriever.query(s, exclude_t_start=s.get("t_start"))
+            retrieved = retriever.query(s, exclude_t_start=None)
             diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
             sys_msg, usr_msg = build_cot_prompt(s, retrieved, diff, sample_node_idx, horizon)
         else:
