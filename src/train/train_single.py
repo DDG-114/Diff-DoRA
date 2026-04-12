@@ -119,6 +119,7 @@ class EVDataset(Dataset):
         items = []
         dropped_no_supervision = 0
         for s in samples:
+            sample_node_idx = int(s.get("node_idx", self.node_idx))
             if self.use_rag and self.retriever is not None:
                 retrieved = self.retriever.query(s, exclude_t_start=s.get("t_start"))
                 weather_current = self._weather_at(s.get("t_start", 0))
@@ -134,15 +135,15 @@ class EVDataset(Dataset):
                     price_retrieved=price_retrieved,
                 )
                 sys_msg, usr_msg = build_cot_prompt(
-                    s, retrieved, diff, node_idx=self.node_idx, horizon=self.horizon
+                    s, retrieved, diff, node_idx=sample_node_idx, horizon=self.horizon
                 )
                 target = "\n" + build_cot_target(
-                    s, retrieved, diff, node_idx=self.node_idx, horizon=self.horizon
+                    s, retrieved, diff, node_idx=sample_node_idx, horizon=self.horizon
                 )
             else:
-                sys_msg, usr_msg = build_vanilla_prompt(s, self.node_idx, self.horizon)
+                sys_msg, usr_msg = build_vanilla_prompt(s, sample_node_idx, self.horizon)
                 # Target: the answer line
-                y = s["y"][:self.horizon, self.node_idx]
+                y = s["y"][:self.horizon, sample_node_idx]
                 target = " [" + ", ".join(f"{v:.3f}" for v in y) + "]"
 
             messages = [
@@ -213,23 +214,25 @@ def run_inference(
     horizon,
     node_idx,
     max_samples=200,
+    max_new_tokens: int = 128,
     use_rag: bool = False,
     retriever: KNNRetriever | None = None,
 ):
     preds, trues = [], []
     subset = test_samples[:max_samples]
     for s in subset:
+        sample_node_idx = int(s.get("node_idx", node_idx))
         if use_rag and retriever is not None:
-            retrieved = retriever.query(s, exclude_t_start=None)
+            retrieved = retriever.query(s, exclude_t_start=s.get("t_start"))
             diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
-            sys_msg, usr_msg = build_cot_prompt(s, retrieved, diff, node_idx, horizon)
+            sys_msg, usr_msg = build_cot_prompt(s, retrieved, diff, sample_node_idx, horizon)
         else:
-            sys_msg, usr_msg = build_vanilla_prompt(s, node_idx, horizon)
-        out = generate(model, tokenizer, sys_msg, usr_msg, max_new_tokens=128)
+            sys_msg, usr_msg = build_vanilla_prompt(s, sample_node_idx, horizon)
+        out = generate(model, tokenizer, sys_msg, usr_msg, max_new_tokens=max_new_tokens)
         arr = parse_output(out, expected_len=horizon)
         if arr is not None and len(arr) == horizon:
             preds.append(arr)
-            trues.append(s["y"][:horizon, node_idx])
+            trues.append(s["y"][:horizon, sample_node_idx])
     return preds, trues
 
 
@@ -249,9 +252,11 @@ def main():
     parser.add_argument("--use_dora",    action="store_true")
     parser.add_argument("--use_rag",     action="store_true",
                         help="Enable retrieval-augmented CoT prompts")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                        help="Enable gradient checkpointing to reduce VRAM")
-    parser.add_argument("--no_gradient_checkpointing", action="store_true",
+    parser.add_argument("--gradient_checkpointing", dest="gradient_checkpointing",
+                        action="store_true", default=True,
+                        help="Enable gradient checkpointing to reduce VRAM (default: enabled)")
+    parser.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing",
+                        action="store_false",
                         help="Disable gradient checkpointing")
     parser.add_argument("--retrieval_cache", default="",
                         help="Path to retrieval cache pkl; default data/retrieval_cache/{dataset}_h{horizon}.pkl")
@@ -259,13 +264,12 @@ def main():
                         help="Cap training samples (for quick tests)")
     parser.add_argument("--eval_max_samples", type=int, default=200,
                         help="Cap evaluation samples for speed")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=128,
+                        help="Generation max_new_tokens during evaluation")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.no_gradient_checkpointing:
-        args.gradient_checkpointing = False
 
     # 1. Load data
     print("Loading dataset …")
@@ -357,6 +361,10 @@ def main():
     # 6. Evaluate
     print("Evaluating …")
     model.eval()
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    if hasattr(model, "config"):
+        model.config.use_cache = True
     preds, trues = run_inference(
         model,
         tokenizer,
@@ -364,6 +372,7 @@ def main():
         args.horizon,
         args.node_idx,
         max_samples=args.eval_max_samples,
+        max_new_tokens=args.eval_max_new_tokens,
         use_rag=args.use_rag,
         retriever=retriever,
     )
