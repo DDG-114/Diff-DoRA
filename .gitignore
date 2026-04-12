@@ -19,12 +19,32 @@ env/
 /models/
 
 # Data – raw and processed (may contain private data)
-data/raw/
-data/processed/
-data/retrieval_cache/
+data/
+.cache_sources/
+*.zip
+*.tar
+*.gz
+*.pkl
+*.npy
+*.pth
+*.bin
+*.csv
+*.h5
+*.parquet
 
 # Outputs / checkpoints
 outputs/
+checkpoints/
+
+# Documentation and Analysis
+SELF_CHECK_REPORT.md
+TRAINING_WORKFLOW.md
+repro_report.md
+repro_spec.md
+taskspec.MD
+paper_alignment.md
+open_issues.md
+X260272_O_editing.doc
 
 # Jupyter
 .ipynb_checkpoints/

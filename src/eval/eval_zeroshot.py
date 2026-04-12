@@ -32,7 +32,7 @@ def main():
     parser.add_argument("--dataset",    default="st_evcdp")
     parser.add_argument("--horizon",    type=int, default=6)
     parser.add_argument("--output_dir", default="outputs/zeroshot")
-    parser.add_argument("--epochs",     type=int, default=2)
+    parser.add_argument("--epochs",     type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr",         type=float, default=1e-4)
     args = parser.parse_args()

@@ -32,6 +32,11 @@ def parse_output(text: str, expected_len: int | None = None) -> np.ndarray | Non
     if "Numerical Prediction:" in text:
         text = text.split("Numerical Prediction:")[-1].strip()
 
+    # Guard against template placeholders, e.g. "[v1, v2, v3]".
+    # These should be treated as parse failure rather than [1, 2, 3].
+    if re.search(r"\bv\d+\b", text):
+        return None
+
     # Try JSON parse of first [ ... ] block
     # 1. nested list
     m = _NESTED_RE.search(text)
@@ -58,6 +63,9 @@ def parse_output(text: str, expected_len: int | None = None) -> np.ndarray | Non
             pass
 
     # 3. bare numbers
+    # Avoid extracting accidental digits from non-numeric placeholders.
+    if re.search(r"[A-DF-Za-df-z]", text):
+        return None
     nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
     if nums:
         arr = np.array([float(n) for n in nums], dtype=np.float32)

@@ -66,7 +66,7 @@ def load_model_and_tokenizer(
 
 def get_lora_model(
     model,
-    use_dora: bool = False,
+    use_dora: bool = True,
     **lora_kwargs,
 ) -> "PeftModel":
     """Wrap base model with LoRA (or DoRA) adapter."""
