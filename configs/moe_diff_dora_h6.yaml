@@ -2,16 +2,18 @@ base_model: models/Qwen2.5-1.5B-Instruct
 dataset: st_evcdp
 horizon: 6
 history_len: 12
+neighbor_k: 7
 lora:
-  r: 8
-  alpha: 16
+  r: 32
+  alpha: 32
   dropout: 0.05
   use_dora: true          # DoRA enabled
 train:
-  epochs: 3
-  batch_size: 4
-  gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4
+  epochs: 2
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-4
+  max_length: 2560
   fp16: true
 routing:
   method: hard            # hard label routing

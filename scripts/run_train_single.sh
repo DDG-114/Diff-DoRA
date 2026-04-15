@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/run_train_single.sh
-# Quick launcher for single-expert LoRA training.
+# Paper-aligned launcher for single-expert LoRA / DoRA training.
 
 set -e
 DATASET=${1:-st_evcdp}
@@ -20,8 +20,6 @@ python -m src.train.train_single \
     --dataset    "$DATASET" \
     --horizon    "$HORIZON" \
     --output_dir "outputs/${OUTNAME}_h${HORIZON}" \
-    --epochs     3 \
-    --batch_size 4 \
     $DORA_FLAG
 
 echo "Training complete."

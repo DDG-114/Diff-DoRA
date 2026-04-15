@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/run_ablation_cot.sh
-# Ablation: vanilla vs RAG vs RAG+CoT
-# Requires adapters to have been trained first.
+# Legacy engineering ablation: vanilla vs RAG vs RAG+CoT.
+# For paper-style ablations, use scripts/run_ablation_paper.sh.
 
 set -e
 DATASET=${1:-st_evcdp}

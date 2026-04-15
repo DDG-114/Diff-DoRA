@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/run_ablation_dora.sh
-# Ablation: LoRA vs DoRA vs Diff-DoRA
+# Legacy engineering ablation: LoRA vs DoRA vs Diff-DoRA on single adapters.
+# For paper-style w/o-MoE / w/o-CoT / w/o-DoRA, use scripts/run_ablation_paper.sh.
 
 set -e
 DATASET=${1:-st_evcdp}

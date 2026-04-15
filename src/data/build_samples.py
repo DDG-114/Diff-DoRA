@@ -33,7 +33,11 @@ def _time_features(timestamps) -> np.ndarray:
     return feats
 
 
-def _neighbour_features(occ: np.ndarray, adj: np.ndarray | None) -> np.ndarray:
+def _neighbour_features(
+    occ: np.ndarray,
+    adj: np.ndarray | None,
+    neighbor_k: int | None = None,
+) -> np.ndarray:
     """
     For each node n, average its direct neighbours' occupancy.
     If adj is None or empty, returns zeros.
@@ -43,6 +47,15 @@ def _neighbour_features(occ: np.ndarray, adj: np.ndarray | None) -> np.ndarray:
     # row-normalise adjacency (exclude self-loops)
     A = adj.copy().astype(np.float32)
     np.fill_diagonal(A, 0.0)
+
+    # Optional: keep only top-k neighbours for each node.
+    if neighbor_k is not None and neighbor_k > 0 and neighbor_k < A.shape[1]:
+        topk_idx = np.argpartition(A, -neighbor_k, axis=1)[:, -neighbor_k:]
+        mask = np.zeros_like(A, dtype=bool)
+        rows = np.arange(A.shape[0])[:, None]
+        mask[rows, topk_idx] = True
+        A = np.where(mask, A, 0.0)
+
     row_sum = A.sum(axis=1, keepdims=True) + 1e-8
     A_norm  = A / row_sum             # (N, N)
     return occ @ A_norm.T             # (T, N)
@@ -54,6 +67,7 @@ def build_samples(
     adj: np.ndarray | None = None,
     horizons: Sequence[int] = VALID_HORIZONS,
     history_len: int = HISTORY_LEN,
+    neighbor_k: int | None = None,
 ) -> dict[int, list[dict]]:
     """
     Build sliding-window samples for each horizon.
@@ -70,7 +84,7 @@ def build_samples(
     else:
         time_feats = np.zeros((T, 4), dtype=np.float32)
 
-    nbr_feats = _neighbour_features(occ, adj)  # (T, N)
+    nbr_feats = _neighbour_features(occ, adj, neighbor_k=neighbor_k)  # (T, N)
 
     max_horizon = max(horizons)
     samples: dict[int, list] = {h: [] for h in horizons}

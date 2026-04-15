@@ -1,8 +1,11 @@
 """
 src/eval/eval_ablation.py
 --------------------------
-Ablation: compare vanilla / RAG / RAG+CoT / MoE / Diff-DoRA variants.
+Ablation: compare legacy engineering variants such as vanilla / RAG / RAG+CoT.
 Each variant is identified by a run name and an adapter path.
+
+For the paper-defined ablations (`w/o MoE`, `w/o CoT`, `w/o DoRA`, `Base Model`),
+use `src.eval.eval_paper_ablation` instead.
 """
 from __future__ import annotations
 

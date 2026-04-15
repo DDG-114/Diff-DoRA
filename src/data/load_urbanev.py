@@ -33,6 +33,20 @@ def _read_csv_safe(path: Path, **kwargs) -> pd.DataFrame:
     return pd.read_csv(path, **kwargs)
 
 
+def _ensure_cached_node_ids(cached: dict, raw_dir: Path) -> dict:
+    if cached.get("node_ids") is not None:
+        return cached
+    occ_path = raw_dir / "occupancy.csv"
+    if occ_path.exists():
+        cols = pd.read_csv(occ_path, nrows=0).columns.tolist()[1:]
+        cached["node_ids"] = [str(c) for c in cols]
+    else:
+        occ = cached.get("occupancy")
+        if occ is not None:
+            cached["node_ids"] = [str(i) for i in range(occ.shape[1])]
+    return cached
+
+
 def normalize(arr: np.ndarray) -> tuple[np.ndarray, float, float]:
     vmin = float(arr.min())
     vmax = float(arr.max())
@@ -63,7 +77,7 @@ def load_urbanev(
     """
     if processed_path.exists() and not force_reprocess:
         with open(processed_path, "rb") as f:
-            return pickle.load(f)
+            return _ensure_cached_node_ids(pickle.load(f), raw_dir)
 
     occ_path = raw_dir / "occupancy.csv"
     if not occ_path.exists():
@@ -99,6 +113,7 @@ def load_urbanev(
         "occupancy": occ_norm,
         "occupancy_raw": occ_raw,
         "timestamps": occ_df.index,
+        "node_ids": [str(c) for c in occ_df.columns],
         "weather": weather,
         "price": price,
         "poi": poi,

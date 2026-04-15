@@ -57,6 +57,7 @@ def build_splits(
         "timestamps_test":  ts[i2:],
         "norm_min": data.get("norm_min", 0.0),
         "norm_max": data.get("norm_max", 1.0),
+        "node_ids": data.get("node_ids"),
         "node_meta": data.get("node_meta"),
         "adj": data.get("adj"),
         "weather": data.get("weather"),

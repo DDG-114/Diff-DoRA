@@ -24,6 +24,21 @@ pip install -r requirements.txt
 | P8 | Full / few / zero-shot experiments |
 | P9 | Reproduction report |
 
+## Paper-Aligned Defaults
+
+The training entry points now default to the paper's Table 4 settings:
+
+- `epochs=2`
+- `batch_size=8`
+- `lr=2e-4`
+- `max_length=2560`
+- `lora_rank=32`
+- `lora_alpha=32`
+- `history_len=12`
+- `neighbor_k=7`
+
+Legacy quick-run outputs under `outputs/` may still reflect earlier exploratory settings.
+
 ## Directory layout
 
 ```

@@ -7,8 +7,7 @@ Usage:
   python -m src.train.train_single \
       --dataset st_evcdp \
       --horizon 6 \
-      --output_dir outputs/single_lora_h6 \
-      --epochs 3
+      --output_dir outputs/single_lora_h6
 
 The script:
 1. Loads and splits the dataset
@@ -40,6 +39,11 @@ from src.data.load_st_evcdp import load_st_evcdp
 from src.data.load_urbanev  import load_urbanev
 from src.data.build_splits  import build_splits
 from src.data.build_samples import build_samples
+from src.utils.node_context import (
+    extract_node_static_context,
+    normalise_domain_label,
+    resolve_node_id,
+)
 from src.eval.metrics       import per_horizon_metrics
 from src.models.qwen_peft   import load_model_and_tokenizer, get_lora_model, generate
 from src.prompts.prompt_vanilla import build_vanilla_prompt
@@ -68,6 +72,10 @@ class EVDataset(Dataset):
         retriever: KNNRetriever | None = None,
         weather=None,
         price=None,
+        node_meta=None,
+        node_ids: list[str] | None = None,
+        poi=None,
+        include_diff_vec: bool = False,
     ):
         self.tokenizer = tokenizer
         self.horizon   = horizon
@@ -77,6 +85,10 @@ class EVDataset(Dataset):
         self.retriever = retriever
         self.weather = weather
         self.price = price
+        self.node_meta = node_meta
+        self.node_ids = node_ids
+        self.poi = poi
+        self.include_diff_vec = include_diff_vec
         self.items = self._build(samples)
 
     def _weather_at(self, t_start: int) -> dict | None:
@@ -96,20 +108,35 @@ class EVDataset(Dataset):
             return d
         return None
 
-    def _price_at(self, t_start: int) -> float | None:
+    def _node_id(self, sample_node_idx: int) -> str | int:
+        return resolve_node_id(sample_node_idx, node_ids=self.node_ids, node_meta=self.node_meta)
+
+    def _static_context(self, sample_node_idx: int) -> dict:
+        return extract_node_static_context(
+            sample_node_idx,
+            node_ids=self.node_ids,
+            node_meta=self.node_meta,
+        )
+
+    def _price_at(self, t_start: int, sample_node_idx: int) -> float | None:
         if self.price is None or getattr(self.price, "empty", True):
             return None
         idx = min(max(int(t_start) + 11, 0), len(self.price) - 1)
         row = self.price.iloc[idx]
+        node_id = self._node_id(sample_node_idx)
         if np.isscalar(row):
             return float(row)
         if hasattr(row, "to_dict"):
             d = row.to_dict()
-            # Prefer exact node column, fallback to mean across columns
-            if self.node_idx in d:
-                return float(d[self.node_idx])
-            if str(self.node_idx) in d:
-                return float(d[str(self.node_idx)])
+            # Prefer exact node id column, fallback to positional index, then mean.
+            if node_id in d:
+                return float(d[node_id])
+            if str(node_id) in d:
+                return float(d[str(node_id)])
+            if sample_node_idx in d:
+                return float(d[sample_node_idx])
+            if str(sample_node_idx) in d:
+                return float(d[str(sample_node_idx)])
             vals = [float(v) for v in d.values() if v is not None]
             if vals:
                 return float(np.mean(vals))
@@ -120,12 +147,15 @@ class EVDataset(Dataset):
         dropped_no_supervision = 0
         for s in samples:
             sample_node_idx = int(s.get("node_idx", self.node_idx))
+            diff_vec = np.zeros(3, dtype=np.float32)
+            static_context = self._static_context(sample_node_idx)
+            domain_label = normalise_domain_label(static_context.get("zone_type"))
             if self.use_rag and self.retriever is not None:
                 retrieved = self.retriever.query(s, exclude_t_start=s.get("t_start"))
                 weather_current = self._weather_at(s.get("t_start", 0))
                 weather_retrieved = [self._weather_at(rs.get("t_start", 0)) for rs in retrieved]
-                price_current = self._price_at(s.get("t_start", 0))
-                price_retrieved = [self._price_at(rs.get("t_start", 0)) for rs in retrieved]
+                price_current = self._price_at(s.get("t_start", 0), sample_node_idx)
+                price_retrieved = [self._price_at(rs.get("t_start", 0), sample_node_idx) for rs in retrieved]
                 diff = compute_diff_features(
                     query_sample=s,
                     retrieved_samples=retrieved,
@@ -134,14 +164,36 @@ class EVDataset(Dataset):
                     price_current=price_current,
                     price_retrieved=price_retrieved,
                 )
+                diff_vec = np.array([
+                    float(diff.get("diff_occ", 0.0) or 0.0),
+                    float(diff.get("diff_temp", 0.0) or 0.0),
+                    float(diff.get("diff_price", 0.0) or 0.0),
+                ], dtype=np.float32)
                 sys_msg, usr_msg = build_cot_prompt(
-                    s, retrieved, diff, node_idx=sample_node_idx, horizon=self.horizon
+                    s,
+                    retrieved,
+                    diff,
+                    node_idx=sample_node_idx,
+                    horizon=self.horizon,
+                    domain_label=domain_label,
+                    static_context=static_context,
                 )
                 target = "\n" + build_cot_target(
-                    s, retrieved, diff, node_idx=sample_node_idx, horizon=self.horizon
+                    s,
+                    retrieved,
+                    diff,
+                    node_idx=sample_node_idx,
+                    horizon=self.horizon,
+                    static_context=static_context,
                 )
             else:
-                sys_msg, usr_msg = build_vanilla_prompt(s, sample_node_idx, self.horizon)
+                sys_msg, usr_msg = build_vanilla_prompt(
+                    s,
+                    sample_node_idx,
+                    self.horizon,
+                    domain_label=domain_label,
+                    static_context=static_context,
+                )
                 # Target: the answer line
                 y = s["y"][:self.horizon, sample_node_idx]
                 target = " [" + ", ".join(f"{v:.3f}" for v in y) + "]"
@@ -184,6 +236,8 @@ class EVDataset(Dataset):
                 "attention_mask": attention_mask,
                 "labels": labels,
             })
+            if self.include_diff_vec:
+                items[-1]["diff_vec"] = diff_vec.tolist()
 
         if not items:
             raise ValueError(
@@ -217,17 +271,46 @@ def run_inference(
     max_new_tokens: int = 128,
     use_rag: bool = False,
     retriever: KNNRetriever | None = None,
+    node_meta=None,
+    node_ids: list[str] | None = None,
+    sampling: str = "head",
+    seed: int = 42,
 ):
     preds, trues = [], []
-    subset = test_samples[:max_samples]
+    if sampling == "random":
+        rng = random.Random(seed)
+        k = min(max_samples, len(test_samples))
+        subset = rng.sample(test_samples, k)
+    else:
+        subset = test_samples[:max_samples]
     for s in subset:
         sample_node_idx = int(s.get("node_idx", node_idx))
+        static_context = extract_node_static_context(
+            sample_node_idx,
+            node_ids=node_ids,
+            node_meta=node_meta,
+        )
+        domain_label = normalise_domain_label(static_context.get("zone_type"))
         if use_rag and retriever is not None:
             retrieved = retriever.query(s, exclude_t_start=None)
             diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
-            sys_msg, usr_msg = build_cot_prompt(s, retrieved, diff, sample_node_idx, horizon)
+            sys_msg, usr_msg = build_cot_prompt(
+                s,
+                retrieved,
+                diff,
+                sample_node_idx,
+                horizon,
+                domain_label=domain_label,
+                static_context=static_context,
+            )
         else:
-            sys_msg, usr_msg = build_vanilla_prompt(s, sample_node_idx, horizon)
+            sys_msg, usr_msg = build_vanilla_prompt(
+                s,
+                sample_node_idx,
+                horizon,
+                domain_label=domain_label,
+                static_context=static_context,
+            )
         out = generate(model, tokenizer, sys_msg, usr_msg, max_new_tokens=max_new_tokens)
         arr = parse_output(out, expected_len=horizon)
         if arr is not None and len(arr) == horizon:
@@ -244,11 +327,19 @@ def main():
     parser.add_argument("--horizon",     type=int, default=6)
     parser.add_argument("--node_idx",    type=int, default=0)
     parser.add_argument("--output_dir",  default="outputs/single_lora_h6")
-    parser.add_argument("--epochs",      type=int, default=3)
-    parser.add_argument("--batch_size",  type=int, default=4)
-    parser.add_argument("--lr",          type=float, default=1e-4)
-    parser.add_argument("--max_length",  type=int, default=384,
-                        help="Tokenization max length (reduce for lower VRAM)")
+    parser.add_argument("--epochs",      type=int, default=2)
+    parser.add_argument("--batch_size",  type=int, default=8)
+    parser.add_argument("--lr",          type=float, default=2e-4)
+    parser.add_argument("--max_length",  type=int, default=2560,
+                        help="Tokenization max length; the paper uses 2560.")
+    parser.add_argument("--lora_rank",   type=int, default=32,
+                        help="LoRA rank; the paper uses 32.")
+    parser.add_argument("--lora_alpha",  type=int, default=32,
+                        help="LoRA alpha (scaling factor); the paper uses 32.")
+    parser.add_argument("--history_len", type=int, default=12,
+                        help="Historical observation window; the paper uses 12.")
+    parser.add_argument("--neighbor_k",  type=int, default=7,
+                        help="Neighbour top-k used for spatial context; the paper uses 7.")
     parser.add_argument("--use_dora",    action="store_true")
     parser.add_argument("--use_rag",     action="store_true",
                         help="Enable retrieval-augmented CoT prompts")
@@ -266,6 +357,10 @@ def main():
                         help="Cap evaluation samples for speed")
     parser.add_argument("--eval_max_new_tokens", type=int, default=128,
                         help="Generation max_new_tokens during evaluation")
+    parser.add_argument("--eval_sampling", choices=["head", "random"], default="head",
+                        help="Evaluation sample selection: head=first N, random=random N")
+    parser.add_argument("--eval_seed", type=int, default=42,
+                        help="Random seed for evaluation sampling when eval_sampling=random")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -283,11 +378,17 @@ def main():
     print("Building samples …")
     train_samples_map = build_samples(
         splits["train"], splits["timestamps_train"],
-        adj=splits.get("adj"), horizons=[args.horizon]
+        adj=splits.get("adj"),
+        horizons=[args.horizon],
+        history_len=args.history_len,
+        neighbor_k=args.neighbor_k,
     )
     test_samples_map = build_samples(
         splits["test"], splits["timestamps_test"],
-        adj=splits.get("adj"), horizons=[args.horizon]
+        adj=splits.get("adj"),
+        horizons=[args.horizon],
+        history_len=args.history_len,
+        neighbor_k=args.neighbor_k,
     )
     train_pool = train_samples_map[args.horizon]
     train_samples = train_pool[:args.max_samples]
@@ -310,7 +411,8 @@ def main():
     # 3. Load model
     print("Loading model …")
     model, tokenizer = load_model_and_tokenizer()
-    model = get_lora_model(model, use_dora=args.use_dora)
+    model = get_lora_model(model, use_dora=args.use_dora,
+                           r=args.lora_rank, lora_alpha=args.lora_alpha)
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
@@ -329,6 +431,9 @@ def main():
         retriever=retriever,
         weather=splits.get("weather"),
         price=splits.get("price"),
+        node_meta=splits.get("node_meta"),
+        node_ids=splits.get("node_ids"),
+        poi=splits.get("poi"),
     )
     collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True, pad_to_multiple_of=8)
 
@@ -337,7 +442,7 @@ def main():
         output_dir=str(out_dir / "checkpoints"),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=1,
         learning_rate=args.lr,
         fp16=True,
         logging_steps=20,
@@ -375,6 +480,10 @@ def main():
         max_new_tokens=args.eval_max_new_tokens,
         use_rag=args.use_rag,
         retriever=retriever,
+        node_meta=splits.get("node_meta"),
+        node_ids=splits.get("node_ids"),
+        sampling=args.eval_sampling,
+        seed=args.eval_seed,
     )
     if preds:
         metrics = per_horizon_metrics(preds, trues, args.horizon,
@@ -386,6 +495,17 @@ def main():
             "horizon":   args.horizon,
             "node_idx":  args.node_idx,
             "use_rag":   args.use_rag,
+            "config": {
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "max_length": args.max_length,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "history_len": args.history_len,
+                "neighbor_k": args.neighbor_k,
+                "use_dora": args.use_dora,
+            },
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "metrics":   metrics,
         }

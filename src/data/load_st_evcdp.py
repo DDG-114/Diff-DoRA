@@ -40,6 +40,18 @@ def load_occupancy(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
     return df
 
 
+def _ensure_cached_node_ids(cached: dict, raw_dir: Path) -> dict:
+    if cached.get("node_ids") is not None:
+        return cached
+    try:
+        cached["node_ids"] = [str(c) for c in load_occupancy(raw_dir).columns]
+    except FileNotFoundError:
+        occ = cached.get("occupancy")
+        if occ is not None:
+            cached["node_ids"] = [str(i) for i in range(occ.shape[1])]
+    return cached
+
+
 def load_node_meta(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
     """Return node metadata DataFrame, index=node_id."""
     path = raw_dir / "nodes.csv"
@@ -98,7 +110,7 @@ def load_st_evcdp(
     """
     if processed_path.exists() and not force_reprocess:
         with open(processed_path, "rb") as f:
-            return pickle.load(f)
+            return _ensure_cached_node_ids(pickle.load(f), raw_dir)
 
     df = load_occupancy(raw_dir)
     node_meta = load_node_meta(raw_dir)
@@ -119,6 +131,7 @@ def load_st_evcdp(
         "occupancy": occ_norm,
         "occupancy_raw": occ_raw,
         "timestamps": df.index,
+        "node_ids": [str(c) for c in df.columns],
         "node_meta": node_meta,
         "adj": adj,
         "norm_min": vmin,

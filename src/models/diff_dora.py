@@ -14,33 +14,39 @@ where g is a small 2-layer MLP with sigmoid output.
 
 Implementation strategy
 -----------------------
-Because PEFT wraps the magnitude as a registered parameter, we inject
-DiffDoRAHook as a forward hook on every LoRA layer after model creation.
-The hook reads a thread-local diff_context that the caller must set before
-each forward pass via `DiffDoRAController.set_context(diff_vec)`.
+Because PEFT wraps DoRA magnitude in a dedicated module, we patch the DoRA
+layer forward path after model creation and inject a differentiable
+sample-conditioned scale factor there.
 """
 from __future__ import annotations
 
-import threading
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from peft import PeftModel
+from peft.utils.integrations import dequantize_module_weight
+from peft.utils.other import transpose
 
 
-# ─── Thread-local context ────────────────────────────────────────────────────
+# ─── Global context (checkpoint-safe) ───────────────────────────────────────
 
-_ctx = threading.local()
+# NOTE:
+# Using thread-local context can break gradient-checkpoint recomputation,
+# because recompute may run on a different worker thread and fail to read the
+# same diff vector, causing forward/recompute graph mismatch.
+_diff_ctx: torch.Tensor | None = None
 
 
-def set_diff_context(diff_vec: torch.Tensor) -> None:
+def set_diff_context(diff_vec: torch.Tensor | None) -> None:
     """Set the current differential feature vector for the next forward pass."""
-    _ctx.diff_vec = diff_vec
+    global _diff_ctx
+    _diff_ctx = diff_vec
 
 
 def get_diff_context() -> torch.Tensor | None:
-    return getattr(_ctx, "diff_vec", None)
+    return _diff_ctx
 
 
 # ─── Controller MLP ──────────────────────────────────────────────────────────
@@ -93,32 +99,117 @@ class DiffDoRAModel(nn.Module):
         super().__init__()
         self.peft_model  = peft_model
         self.controller  = DiffController(diff_input_dim, hidden_dim, scale)
-        self._register_hooks()
+        self._patched_layers: list[tuple[nn.Module, Any]] = []
+        self._patch_dora_layers()
 
-    def _register_hooks(self):
-        self._hooks = []
-        for name, module in self.peft_model.named_modules():
-            # PEFT DoRA stores magnitude as "lora_magnitude_vector"
-            if hasattr(module, "lora_magnitude_vector"):
-                hook = module.register_forward_pre_hook(self._make_hook(module))
-                self._hooks.append(hook)
+    def _get_scale_factor(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+        diff_vec = get_diff_context()
+        if diff_vec is None:
+            return None
+        gate = self.controller(diff_vec.to(device=device))
+        return (1.0 + gate.squeeze()).to(device=device, dtype=dtype)
 
-    def _make_hook(self, module):
-        def hook(mod, inputs):
-            diff_vec = get_diff_context()
-            if diff_vec is None:
-                return inputs
-            gate = self.controller(diff_vec.to(mod.lora_magnitude_vector.device))
-            # Temporarily scale the magnitude; will be restored by no-grad context
-            # (We add to the original magnitude)
-            mod.lora_magnitude_vector.data *= (1.0 + gate.squeeze())
-            return inputs
-        return hook
+    def _patch_dora_layers(self):
+        for module in self.peft_model.modules():
+            mag = getattr(module, "lora_magnitude_vector", None)
+            if not isinstance(mag, nn.ModuleDict):
+                continue
+            for dora_layer in mag.values():
+                self._patch_single_dora_layer(dora_layer)
 
-    def forward(self, **kwargs) -> Any:
-        return self.peft_model(**kwargs)
+    def _patch_single_dora_layer(self, dora_layer: nn.Module):
+        if getattr(dora_layer, "_diffdora_patched", False):
+            return
+
+        original_forward = dora_layer.forward
+        outer = self
+
+        def forward_with_diff(x, *args, **kwargs):
+            scale_factor = outer._get_scale_factor(dora_layer.weight.device, dora_layer.weight.dtype)
+            if scale_factor is None:
+                return original_forward(x, *args, **kwargs)
+
+            lora_A = kwargs["lora_A"]
+            lora_B = kwargs["lora_B"]
+            scaling = kwargs["scaling"]
+            base_layer = kwargs["base_layer"]
+            magnitude = dora_layer.weight * scale_factor
+
+            # Linear path: this is the one used by Qwen target modules.
+            if "embed_fn" not in kwargs and not hasattr(dora_layer, "conv_fn"):
+                base_result = kwargs.get("base_result")
+                x_eye = torch.eye(lora_A.weight.shape[1], device=lora_A.weight.device, dtype=x.dtype)
+                lora_weight = lora_B(lora_A(x_eye)).T
+                weight = dequantize_module_weight(base_layer).to(x.dtype)
+                weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
+                mag_norm_scale = (magnitude / weight_norm).view(1, -1)
+
+                lora_result = lora_B(lora_A(x))
+                if base_result is not None:
+                    bias = base_layer.bias
+                    if bias is not None:
+                        base_result = base_result - bias
+                else:
+                    base_result = F.linear(x, transpose(weight, dora_layer.fan_in_fan_out))
+
+                return (mag_norm_scale - 1) * base_result + mag_norm_scale * lora_result * scaling
+
+            # Embedding path for completeness.
+            if "embed_fn" in kwargs:
+                embed_fn = kwargs["embed_fn"]
+                lora_weight = (lora_A @ lora_B).T
+                weight = base_layer.weight
+                weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
+                mag_norm_scale = magnitude / weight_norm
+                result_dora = mag_norm_scale * (embed_fn(x, lora_A) @ lora_B) * scaling
+                return mag_norm_scale, result_dora
+
+            # Conv path for completeness.
+            base_result = kwargs.get("base_result")
+            weight = base_layer.weight
+            r = lora_A.weight.shape[0]
+            lora_weight = torch.mm(lora_B.weight.view([-1, r]), lora_A.weight.view([r, -1]))
+            lora_weight = lora_weight.reshape(weight.shape)
+            weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
+            mag_norm_scale = magnitude / weight_norm
+
+            if base_result is None:
+                base_result = dora_layer.conv_fn(
+                    x,
+                    weight,
+                    bias=None,
+                    stride=base_layer.stride,
+                    padding=base_layer.padding,
+                    dilation=base_layer.dilation,
+                    groups=base_layer.groups,
+                )
+            else:
+                bias = base_layer.bias
+                if bias is not None:
+                    bias_shape = (1, -1) + (1,) * (base_result.dim() - 2)
+                    base_result = base_result - bias.view(*bias_shape)
+
+            return (mag_norm_scale - 1) * base_result + mag_norm_scale * lora_B(lora_A(x)) * scaling
+
+        dora_layer.forward = forward_with_diff
+        dora_layer._diffdora_original_forward = original_forward
+        dora_layer._diffdora_patched = True
+        self._patched_layers.append((dora_layer, original_forward))
+
+    def forward(self, *args, **kwargs) -> Any:
+        return self.peft_model(*args, **kwargs)
+
+    @property
+    def device(self):
+        if hasattr(self.peft_model, "device"):
+            return self.peft_model.device
+        return next(self.peft_model.parameters()).device
+
+    def generate(self, *args, **kwargs):
+        return self.peft_model.generate(*args, **kwargs)
 
     def remove_hooks(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
+        for layer, original_forward in self._patched_layers:
+            layer.forward = original_forward
+            layer._diffdora_patched = False
+        self._patched_layers.clear()

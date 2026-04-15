@@ -24,8 +24,8 @@ from peft import (
 MODEL_PATH = str(Path("models/Qwen2.5-1.5B-Instruct"))
 
 LORA_CONFIG = dict(
-    r=8,
-    lora_alpha=16,
+    r=32,
+    lora_alpha=32,
     lora_dropout=0.05,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                     "gate_proj", "up_proj", "down_proj"],
@@ -93,8 +93,8 @@ def generate(
     tokenizer,
     system_msg: str,
     user_msg: str,
-    max_new_tokens: int = 256,
-    temperature: float = 0.1,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
 ) -> str:
     """Generate a response given system + user messages."""
     messages = [
@@ -105,12 +105,20 @@ def generate(
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    do_sample = bool(temperature and temperature > 0)
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        pad_token_id=tokenizer.pad_token_id,
+        remove_invalid_values=True,
+        renormalize_logits=True,
+    )
+    if do_sample:
+        gen_kwargs["temperature"] = float(temperature)
+
     output_ids = model.generate(
         **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
-        temperature=temperature if temperature > 0 else None,
-        pad_token_id=tokenizer.pad_token_id,
+        **gen_kwargs,
     )
     # Decode only new tokens
     new_ids = output_ids[0][inputs["input_ids"].shape[1]:]

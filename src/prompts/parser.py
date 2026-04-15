@@ -18,6 +18,26 @@ import numpy as np
 
 _LIST_RE = re.compile(r"\[[\d\s,.\-eE]+\]")
 _NESTED_RE = re.compile(r"\[\s*\[[\d\s,.\-eE]+\](?:\s*,\s*\[[\d\s,.\-eE]+\])*\s*\]")
+_PLACEHOLDER_EQ_RE = re.compile(r"\[[^\]]*\bv\d+\b[^\]]*\]\s*=\s*", re.IGNORECASE)
+
+
+def _coerce_expected_len(arr: np.ndarray, expected_len: int | None) -> np.ndarray:
+    if expected_len is None or arr.ndim != 1 or len(arr) == expected_len:
+        return arr
+    if len(arr) > expected_len:
+        return arr[:expected_len]
+    if len(arr) == 0:
+        return np.zeros(expected_len, dtype=np.float32)
+    return np.pad(arr, (0, expected_len - len(arr)), constant_values=arr[-1])
+
+
+def _iter_json_candidates(text: str):
+    for regex in (_NESTED_RE, _LIST_RE):
+        for match in regex.finditer(text):
+            candidate = match.group().strip()
+            if re.search(r"\bv\d+\b", candidate, flags=re.IGNORECASE):
+                continue
+            yield candidate
 
 
 def parse_output(text: str, expected_len: int | None = None) -> np.ndarray | None:
@@ -32,35 +52,25 @@ def parse_output(text: str, expected_len: int | None = None) -> np.ndarray | Non
     if "Numerical Prediction:" in text:
         text = text.split("Numerical Prediction:")[-1].strip()
 
+    # Common paper/prompt format: "[v1, ..., vH] = [0.1, 0.2, ...]"
+    text = _PLACEHOLDER_EQ_RE.sub("", text)
+
     # Guard against template placeholders, e.g. "[v1, v2, v3]".
     # These should be treated as parse failure rather than [1, 2, 3].
-    if re.search(r"\bv\d+\b", text):
+    if re.search(r"\bv\d+\b", text) and not any(_iter_json_candidates(text)):
         return None
 
     # Try JSON parse of first [ ... ] block
-    # 1. nested list
-    m = _NESTED_RE.search(text)
-    if m:
+    # Use the last valid numeric list so we can tolerate explanatory examples
+    # earlier in the generation.
+    last_arr = None
+    for candidate in _iter_json_candidates(text):
         try:
-            arr = np.array(json.loads(m.group()), dtype=np.float32)
-            return arr
+            last_arr = np.array(json.loads(candidate), dtype=np.float32)
         except (json.JSONDecodeError, ValueError):
             pass
-
-    # 2. flat list
-    m = _LIST_RE.search(text)
-    if m:
-        try:
-            arr = np.array(json.loads(m.group()), dtype=np.float32)
-            if expected_len is not None and len(arr) != expected_len:
-                # Try to truncate / pad gracefully
-                if len(arr) > expected_len:
-                    arr = arr[:expected_len]
-                else:
-                    arr = np.pad(arr, (0, expected_len - len(arr)), constant_values=arr[-1] if len(arr) else 0.0)
-            return arr
-        except (json.JSONDecodeError, ValueError):
-            pass
+    if last_arr is not None:
+        return _coerce_expected_len(last_arr, expected_len)
 
     # 3. bare numbers
     # Avoid extracting accidental digits from non-numeric placeholders.
@@ -69,9 +79,7 @@ def parse_output(text: str, expected_len: int | None = None) -> np.ndarray | Non
     nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
     if nums:
         arr = np.array([float(n) for n in nums], dtype=np.float32)
-        if expected_len is not None:
-            arr = arr[:expected_len]
-        return arr
+        return _coerce_expected_len(arr, expected_len)
 
     return None
 

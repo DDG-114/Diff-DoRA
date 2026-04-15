@@ -27,12 +27,14 @@ Reproduce key results of "LR-MoE: Logic-Reasoning Mixture-of-Experts for EV Char
 | History window | 12 |
 | Forecast horizons | 3, 6, 9, 12 |
 | KNN top-k | 2 |
-| LoRA rank | 8 |
-| LoRA alpha | 16 |
+| LoRA rank | 32 |
+| LoRA alpha | 32 |
 | Batch size | 8 |
-| Learning rate | 1e-4 |
-| Epochs | 3 |
+| Learning rate | 2e-4 |
+| Epochs | 2 |
+| Max length | 2560 |
+| Neighbour top-k | 7 |
 
 ## Experiment log convention
 Every run writes a JSON file to `outputs/<run_id>/metrics.json` with keys:
-`run_id, dataset, horizon, rmse, mae, timestamp, config_path`
+`run_id, dataset, horizon, timestamp, config, metrics`
