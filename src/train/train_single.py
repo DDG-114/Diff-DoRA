@@ -46,11 +46,11 @@ from src.utils.node_context import (
 )
 from src.eval.metrics       import per_horizon_metrics
 from src.models.qwen_peft   import load_model_and_tokenizer, get_lora_model, generate
-from src.prompts.prompt_vanilla import build_vanilla_prompt
+from src.prompts.prompt_vanilla import build_direct_physical_prompt, build_vanilla_prompt
 from src.prompts.prompt_cot import build_cot_prompt, build_cot_target
 from src.prompts.parser     import parse_output
 from src.retrieval.knn_retriever import KNNRetriever
-from src.retrieval.diff_features import compute_diff_features
+from src.retrieval.diff_features import compute_diff_features, format_diff_block
 
 
 # ─── Dataset wrapper ──────────────────────────────────────────────────────────
@@ -60,6 +60,8 @@ class EVDataset(Dataset):
     Each item is one (prompt, target) pair for a single node/horizon.
     The model is trained to produce only the target tokens.
     """
+
+    PROMPT_STYLES = {"auto", "cot", "direct_physical", "vanilla"}
 
     def __init__(
         self,
@@ -76,11 +78,12 @@ class EVDataset(Dataset):
         node_ids: list[str] | None = None,
         poi=None,
         include_diff_vec: bool = False,
+        prompt_style: str = "auto",
     ):
         self.tokenizer = tokenizer
-        self.horizon   = horizon
+        self.horizon = horizon
         self.max_length = max_length
-        self.node_idx  = node_idx
+        self.node_idx = node_idx
         self.use_rag = use_rag
         self.retriever = retriever
         self.weather = weather
@@ -89,6 +92,13 @@ class EVDataset(Dataset):
         self.node_ids = node_ids
         self.poi = poi
         self.include_diff_vec = include_diff_vec
+        if prompt_style not in self.PROMPT_STYLES:
+            raise ValueError(
+                f"Unsupported prompt_style={prompt_style!r}; expected one of {sorted(self.PROMPT_STYLES)}"
+            )
+        if prompt_style in {"cot", "direct_physical"} and not use_rag:
+            raise ValueError(f"prompt_style={prompt_style!r} requires use_rag=True")
+        self.prompt_style = prompt_style
         self.items = self._build(samples)
 
     def _weather_at(self, t_start: int) -> dict | None:
@@ -98,7 +108,6 @@ class EVDataset(Dataset):
         row = self.weather.iloc[idx]
         if hasattr(row, "to_dict"):
             d = row.to_dict()
-            # normalize common keys
             for k in list(d.keys()):
                 lk = str(k).lower()
                 if "temp" in lk and "temperature" not in d:
@@ -128,7 +137,6 @@ class EVDataset(Dataset):
             return float(row)
         if hasattr(row, "to_dict"):
             d = row.to_dict()
-            # Prefer exact node id column, fallback to positional index, then mean.
             if node_id in d:
                 return float(d[node_id])
             if str(node_id) in d:
@@ -142,6 +150,18 @@ class EVDataset(Dataset):
                 return float(np.mean(vals))
         return None
 
+    def _numeric_target(self, y: np.ndarray) -> str:
+        return " [" + ", ".join(f"{v:.3f}" for v in y) + "]"
+
+    def _effective_prompt_style(self, has_retrieval: bool) -> str:
+        if self.prompt_style == "auto":
+            return "cot" if has_retrieval else "vanilla"
+        if self.prompt_style in {"cot", "direct_physical"} and not has_retrieval:
+            raise ValueError(
+                f"prompt_style={self.prompt_style!r} requires retrieval context, but no retriever was available."
+            )
+        return self.prompt_style
+
     def _build(self, samples: list[dict]) -> list[dict]:
         items = []
         dropped_no_supervision = 0
@@ -150,6 +170,8 @@ class EVDataset(Dataset):
             diff_vec = np.zeros(3, dtype=np.float32)
             static_context = self._static_context(sample_node_idx)
             domain_label = normalise_domain_label(static_context.get("zone_type"))
+            retrieved = []
+            diff = None
             if self.use_rag and self.retriever is not None:
                 retrieved = self.retriever.query(s, exclude_t_start=s.get("t_start"))
                 weather_current = self._weather_at(s.get("t_start", 0))
@@ -163,12 +185,16 @@ class EVDataset(Dataset):
                     weather_retrieved=weather_retrieved,
                     price_current=price_current,
                     price_retrieved=price_retrieved,
+                    node_idx=sample_node_idx,
                 )
                 diff_vec = np.array([
                     float(diff.get("diff_occ", 0.0) or 0.0),
                     float(diff.get("diff_temp", 0.0) or 0.0),
                     float(diff.get("diff_price", 0.0) or 0.0),
                 ], dtype=np.float32)
+
+            prompt_style = self._effective_prompt_style(bool(retrieved) and diff is not None)
+            if prompt_style == "cot":
                 sys_msg, usr_msg = build_cot_prompt(
                     s,
                     retrieved,
@@ -186,6 +212,18 @@ class EVDataset(Dataset):
                     horizon=self.horizon,
                     static_context=static_context,
                 )
+            elif prompt_style == "direct_physical":
+                sys_msg, usr_msg = build_direct_physical_prompt(
+                    s,
+                    retrieved,
+                    format_diff_block(diff),
+                    node_idx=sample_node_idx,
+                    horizon=self.horizon,
+                    domain_label=domain_label,
+                    static_context=static_context,
+                )
+                y = s["y"][:self.horizon, sample_node_idx]
+                target = self._numeric_target(y)
             else:
                 sys_msg, usr_msg = build_vanilla_prompt(
                     s,
@@ -194,19 +232,17 @@ class EVDataset(Dataset):
                     domain_label=domain_label,
                     static_context=static_context,
                 )
-                # Target: the answer line
                 y = s["y"][:self.horizon, sample_node_idx]
-                target = " [" + ", ".join(f"{v:.3f}" for v in y) + "]"
+                target = self._numeric_target(y)
 
             messages = [
-                {"role": "system",    "content": sys_msg},
-                {"role": "user",      "content": usr_msg},
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": usr_msg},
                 {"role": "assistant", "content": target},
             ]
             full_text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False
             )
-            # Find where assistant response starts
             prompt_messages = messages[:-1]
             prompt_text = self.tokenizer.apply_chat_template(
                 prompt_messages, tokenize=False, add_generation_prompt=True
@@ -214,10 +250,8 @@ class EVDataset(Dataset):
             prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
             full_ids = self.tokenizer(full_text, add_special_tokens=False)["input_ids"]
 
-            # Mask prompt tokens so loss is only on assistant target tokens.
             labels_full = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
 
-            # IMPORTANT: keep tail when truncating so assistant target is preserved.
             if len(full_ids) > self.max_length:
                 input_ids = full_ids[-self.max_length:]
                 labels = labels_full[-self.max_length:]
@@ -293,7 +327,11 @@ def run_inference(
         domain_label = normalise_domain_label(static_context.get("zone_type"))
         if use_rag and retriever is not None:
             retrieved = retriever.query(s, exclude_t_start=None)
-            diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
+            diff = compute_diff_features(
+                query_sample=s,
+                retrieved_samples=retrieved,
+                node_idx=sample_node_idx,
+            )
             sys_msg, usr_msg = build_cot_prompt(
                 s,
                 retrieved,

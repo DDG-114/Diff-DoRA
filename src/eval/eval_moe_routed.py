@@ -34,7 +34,7 @@ from src.data.build_splits import build_splits
 from src.data.build_samples import build_samples
 from src.utils.node_context import extract_node_static_context
 from src.eval.metrics import per_horizon_metrics
-from src.models.qwen_peft import load_model_and_tokenizer, load_peft_model, generate
+from src.models.qwen_peft import load_model_and_tokenizer, load_peft_model, generate_batch
 from src.prompts.prompt_cot import build_cot_prompt
 from src.prompts.prompt_vanilla import build_vanilla_prompt
 from src.prompts.parser import parse_output
@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--max_nodes", type=int, default=0,
                         help="If >0, only evaluate the first N nodes; default evaluates all nodes.")
     parser.add_argument("--max_new_tokens", type=int, default=160)
+    parser.add_argument("--infer_batch_size", type=int, default=8,
+                        help="Generation batch size per expert during evaluation.")
     parser.add_argument("--sampling", choices=["head", "random"], default="random")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_prompts", action="store_true", default=True,
@@ -97,6 +99,8 @@ def main():
     else:
         subset = all_samples[:args.max_eval]
 
+    train_sample_map = None
+
     # Load retriever
     retriever = None
     if args.use_rag:
@@ -104,11 +108,23 @@ def main():
             cache_path = Path(args.retrieval_cache)
         else:
             cache_path = Path(f"data/retrieval_cache/{args.dataset}_h{args.horizon}.pkl")
-        if not cache_path.exists():
-            raise FileNotFoundError(
-                f"Retrieval cache not found: {cache_path}. Build cache first or pass --retrieval_cache."
+        if cache_path.exists():
+            retriever = KNNRetriever.load(cache_path)
+            print(f"Loaded retrieval cache: {cache_path}")
+        else:
+            train_sample_map = build_samples(
+                splits["train"],
+                splits["timestamps_train"],
+                adj=splits.get("adj"),
+                horizons=[args.horizon],
+                history_len=args.history_len,
+                neighbor_k=args.neighbor_k,
             )
-        retriever = KNNRetriever.load(cache_path)
+            train_pool = train_sample_map[args.horizon]
+            print(
+                f"Retrieval cache not found, building in-memory retriever from train pool: {len(train_pool)}"
+            )
+            retriever = KNNRetriever(train_pool, top_k=2)
 
     # Load experts
     print("Loading base model and experts …")
@@ -149,24 +165,23 @@ def main():
     print(f"Total inferences: {len(subset)} samples x {len(node_indices)} nodes = {len(subset) * len(node_indices)}\n")
     total_done = 0
     total_requested = len(subset) * len(node_indices)
+
+    def batched(items, batch_size: int):
+        for start in range(0, len(items), batch_size):
+            yield items[start:start + batch_size]
+
     for i, sample in enumerate(subset):
         if args.use_rag and retriever is not None:
             retrieved = retriever.query(sample, exclude_t_start=None)
-            diff = compute_diff_features(query_sample=sample, retrieved_samples=retrieved)
             retrieved_t_starts = [int(s.get("t_start", -1)) for s in retrieved]
         else:
             retrieved = []
-            diff = None
             retrieved_t_starts = []
 
+        jobs_by_expert = {0: [], 1: []}
         for sample_node_idx in node_indices:
-            total_done += 1
-
             # HARD ROUTING: route based on node's physical attribute (CBD or Residential)
             expert_id = router.route(sample_node_idx)
-            routing_stats[expert_id] += 1
-
-            expert = experts[expert_id]
             expert_domain = "CBD" if expert_id == 0 else "Residential"
             static_context = extract_node_static_context(
                 sample_node_idx,
@@ -175,7 +190,12 @@ def main():
             )
 
             # Build prompt with physical attribute metadata
-            if args.use_rag and retriever is not None and diff is not None:
+            if args.use_rag and retriever is not None:
+                diff = compute_diff_features(
+                    query_sample=sample,
+                    retrieved_samples=retrieved,
+                    node_idx=sample_node_idx,
+                )
                 sys_msg, usr_msg = build_cot_prompt(
                     sample,
                     retrieved,
@@ -194,38 +214,55 @@ def main():
                     static_context=static_context,
                 )
 
-            raw_output = generate(
-                expert,
-                tokenizer,
-                sys_msg,
-                usr_msg,
-                max_new_tokens=args.max_new_tokens,
-            )
-
-            parsed = parse_output(raw_output, expected_len=args.horizon)
-            parse_ok = parsed is not None and len(parsed) == args.horizon
-
-            target = sample["y"][:args.horizon, sample_node_idx]
-            if parse_ok:
-                preds.append(parsed)
-                trues.append(target)
-
-            row = {
-                "sample_index": i,
-                "t_start": int(sample.get("t_start", -1)),
+            jobs_by_expert[expert_id].append({
                 "node_idx": sample_node_idx,
                 "expert_id": expert_id,
                 "expert_domain": expert_domain,
-                "parse_ok": parse_ok,
-                "retrieved_t_starts": retrieved_t_starts,
-                "raw_generation": raw_output,
-                "parsed_prediction": parsed.tolist() if parse_ok else None,
-                "target": target.tolist(),
-            }
-            if args.save_prompts:
-                row["system_prompt"] = sys_msg
-                row["user_prompt"] = usr_msg
-            records.append(row)
+                "system_prompt": sys_msg,
+                "user_prompt": usr_msg,
+                "target": sample["y"][:args.horizon, sample_node_idx],
+            })
+
+        for expert_id, jobs in jobs_by_expert.items():
+            if not jobs:
+                continue
+
+            expert = experts[expert_id]
+            routing_stats[expert_id] += len(jobs)
+            for chunk in batched(jobs, max(1, args.infer_batch_size)):
+                prompts = [(job["system_prompt"], job["user_prompt"]) for job in chunk]
+                raw_outputs = generate_batch(
+                    expert,
+                    tokenizer,
+                    prompts,
+                    max_new_tokens=args.max_new_tokens,
+                )
+
+                for job, raw_output in zip(chunk, raw_outputs):
+                    total_done += 1
+                    parsed = parse_output(raw_output, expected_len=args.horizon)
+                    parse_ok = parsed is not None and len(parsed) == args.horizon
+
+                    if parse_ok:
+                        preds.append(parsed)
+                        trues.append(job["target"])
+
+                    row = {
+                        "sample_index": i,
+                        "t_start": int(sample.get("t_start", -1)),
+                        "node_idx": job["node_idx"],
+                        "expert_id": job["expert_id"],
+                        "expert_domain": job["expert_domain"],
+                        "parse_ok": parse_ok,
+                        "retrieved_t_starts": retrieved_t_starts,
+                        "raw_generation": raw_output,
+                        "parsed_prediction": parsed.tolist() if parse_ok else None,
+                        "target": job["target"].tolist(),
+                    }
+                    if args.save_prompts:
+                        row["system_prompt"] = job["system_prompt"]
+                        row["user_prompt"] = job["user_prompt"]
+                    records.append(row)
 
         # Progress display every 5 samples
         if (i + 1) % 5 == 0 or i == len(subset) - 1:
@@ -247,6 +284,7 @@ def main():
         "neighbor_k": args.neighbor_k,
         "max_eval": args.max_eval,
         "max_nodes": args.max_nodes,
+        "infer_batch_size": args.infer_batch_size,
         "sampling": args.sampling,
         "seed": args.seed,
         "max_new_tokens": args.max_new_tokens,

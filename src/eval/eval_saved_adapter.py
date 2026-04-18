@@ -82,9 +82,19 @@ def main():
             retriever = KNNRetriever.load(cache_path)
             print(f"Loaded retrieval cache: {cache_path}")
         else:
-            raise FileNotFoundError(
-                f"Retrieval cache not found: {cache_path}. Build cache first or pass --retrieval_cache."
+            train_map = build_samples(
+                splits["train"],
+                splits["timestamps_train"],
+                adj=splits.get("adj"),
+                horizons=[args.horizon],
+                history_len=args.history_len,
+                neighbor_k=args.neighbor_k,
             )
+            train_pool = train_map[args.horizon]
+            print(
+                f"Retrieval cache not found, building in-memory retriever from train pool: {len(train_pool)}"
+            )
+            retriever = KNNRetriever(train_pool, top_k=2)
 
     print("Loading base model …")
     base_model, tokenizer = load_model_and_tokenizer()
@@ -114,7 +124,11 @@ def main():
         domain_label = normalise_domain_label(static_context.get("zone_type"))
         if args.use_rag and retriever is not None:
             retrieved = retriever.query(sample, exclude_t_start=None)
-            diff = compute_diff_features(query_sample=sample, retrieved_samples=retrieved)
+            diff = compute_diff_features(
+                query_sample=sample,
+                retrieved_samples=retrieved,
+                node_idx=sample_node_idx,
+            )
             sys_msg, usr_msg = build_cot_prompt(
                 sample,
                 retrieved,

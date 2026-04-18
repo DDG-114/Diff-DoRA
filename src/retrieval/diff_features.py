@@ -31,6 +31,7 @@ def compute_diff_features(
     weather_retrieved: list[dict] | None = None,
     price_current: float | None = None,
     price_retrieved: list[float] | None = None,
+    node_idx: int | None = None,
 ) -> dict:
     """
     Compute differential features between query and retrieved samples.
@@ -43,18 +44,24 @@ def compute_diff_features(
     weather_retrieved : list of the same dicts for retrieved samples
     price_current     : electricity price at query time
     price_retrieved   : list of prices at retrieved times
+    node_idx          : if set, compute occupancy diff for this node only;
+                        otherwise fallback to the historical graph-wide mean
 
     Returns
     -------
     {
-        "diff_occ":   float,   # mean occupancy difference
+        "diff_occ":   float,   # occupancy difference (node-specific if node_idx is set)
         "diff_temp":  float | None,
         "diff_price": float | None,
     }
     """
     # Occupancy diff
-    curr_occ = float(query_sample["x_hist"].mean())
-    hist_occ = _safe_mean([s["x_hist"].mean() for s in retrieved_samples])
+    if node_idx is not None:
+        curr_occ = float(query_sample["x_hist"][:, int(node_idx)].mean())
+        hist_occ = _safe_mean([s["x_hist"][:, int(node_idx)].mean() for s in retrieved_samples])
+    else:
+        curr_occ = float(query_sample["x_hist"].mean())
+        hist_occ = _safe_mean([s["x_hist"].mean() for s in retrieved_samples])
     diff_occ = curr_occ - hist_occ
 
     # Temperature diff

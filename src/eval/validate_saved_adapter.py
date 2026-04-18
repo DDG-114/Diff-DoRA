@@ -98,11 +98,23 @@ def main():
             cache_path = Path(args.retrieval_cache)
         else:
             cache_path = Path(f"data/retrieval_cache/{args.dataset}_h{args.horizon}.pkl")
-        if not cache_path.exists():
-            raise FileNotFoundError(
-                f"Retrieval cache not found: {cache_path}. Build cache first or pass --retrieval_cache."
+        if cache_path.exists():
+            retriever = KNNRetriever.load(cache_path)
+            print(f"Loaded retrieval cache: {cache_path}")
+        else:
+            train_map = build_samples(
+                splits["train"],
+                splits["timestamps_train"],
+                adj=splits.get("adj"),
+                horizons=[args.horizon],
+                history_len=args.history_len,
+                neighbor_k=args.neighbor_k,
             )
-        retriever = KNNRetriever.load(cache_path)
+            train_pool = train_map[args.horizon]
+            print(
+                f"Retrieval cache not found, building in-memory retriever from train pool: {len(train_pool)}"
+            )
+            retriever = KNNRetriever(train_pool, top_k=2)
 
     print("Loading model …")
     base_model, tokenizer = load_model_and_tokenizer()
@@ -128,7 +140,11 @@ def main():
 
         if args.use_rag and retriever is not None:
             retrieved = retriever.query(sample, exclude_t_start=None)
-            diff = compute_diff_features(query_sample=sample, retrieved_samples=retrieved)
+            diff = compute_diff_features(
+                query_sample=sample,
+                retrieved_samples=retrieved,
+                node_idx=sample_node_idx,
+            )
             sys_msg, usr_msg = build_cot_prompt(
                 sample,
                 retrieved,

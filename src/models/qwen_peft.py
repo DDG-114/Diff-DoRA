@@ -87,24 +87,17 @@ def load_peft_model(
     return PeftModel.from_pretrained(base_model, adapter_path)
 
 
-@torch.inference_mode()
-def generate(
-    model,
-    tokenizer,
-    system_msg: str,
-    user_msg: str,
-    max_new_tokens: int = 512,
-    temperature: float = 0.0,
-) -> str:
-    """Generate a response given system + user messages."""
+def _build_chat_text(tokenizer, system_msg: str, user_msg: str) -> str:
     messages = [
         {"role": "system", "content": system_msg},
         {"role": "user",   "content": user_msg},
     ]
-    text = tokenizer.apply_chat_template(
+    return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+
+def _generation_kwargs(tokenizer, max_new_tokens: int, temperature: float) -> dict:
     do_sample = bool(temperature and temperature > 0)
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
@@ -115,11 +108,62 @@ def generate(
     )
     if do_sample:
         gen_kwargs["temperature"] = float(temperature)
+    return gen_kwargs
+
+
+@torch.inference_mode()
+def generate(
+    model,
+    tokenizer,
+    system_msg: str,
+    user_msg: str,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+) -> str:
+    """Generate a response given system + user messages."""
+    text = _build_chat_text(tokenizer, system_msg, user_msg)
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    gen_kwargs = _generation_kwargs(tokenizer, max_new_tokens, temperature)
 
     output_ids = model.generate(
         **inputs,
         **gen_kwargs,
     )
+    tokenizer.padding_side = old_padding_side
     # Decode only new tokens
     new_ids = output_ids[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_ids, skip_special_tokens=True)
+
+
+@torch.inference_mode()
+def generate_batch(
+    model,
+    tokenizer,
+    prompts: list[tuple[str, str]],
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+) -> list[str]:
+    """Generate batched responses for multiple (system, user) prompts."""
+    if not prompts:
+        return []
+
+    texts = [_build_chat_text(tokenizer, system_msg, user_msg) for system_msg, user_msg in prompts]
+    old_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+    input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+    gen_kwargs = _generation_kwargs(tokenizer, max_new_tokens, temperature)
+
+    output_ids = model.generate(
+        **inputs,
+        **gen_kwargs,
+    )
+    tokenizer.padding_side = old_padding_side
+
+    outputs = []
+    for row_idx, prompt_len in enumerate(input_lengths):
+        new_ids = output_ids[row_idx][int(prompt_len):]
+        outputs.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+    return outputs

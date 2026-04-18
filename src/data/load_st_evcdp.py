@@ -16,7 +16,6 @@ Usage:
 """
 from __future__ import annotations
 
-import os
 import pickle
 from pathlib import Path
 
@@ -27,6 +26,61 @@ RAW_DIR = Path("data/raw/st_evcdp")
 PROCESSED_PATH = Path("data/processed/st_evcdp.pkl")
 
 
+def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(col).lstrip("\ufeff").strip() for col in df.columns]
+    return df
+
+
+def _load_time_index(raw_dir: Path = RAW_DIR) -> pd.DatetimeIndex | None:
+    path = raw_dir / "time.csv"
+    if not path.exists():
+        return None
+
+    df = _normalise_columns(pd.read_csv(path))
+    lowered = {str(col).lower(): col for col in df.columns}
+    required = ["year", "month", "day", "hour", "minute"]
+    if any(col not in lowered for col in required):
+        return None
+
+    rename_map = {lowered[name]: name for name in required}
+    if "second" in lowered:
+        rename_map[lowered["second"]] = "second"
+    df = df.rename(columns=rename_map)
+    if "second" not in df.columns:
+        df["second"] = 0
+
+    ts = pd.to_datetime(
+        df[["year", "month", "day", "hour", "minute", "second"]],
+        errors="coerce",
+    )
+    if ts.isna().all():
+        return None
+    return pd.DatetimeIndex(ts)
+
+
+def _read_aligned_timeseries(path: Path, *, time_index: pd.DatetimeIndex | None = None) -> pd.DataFrame:
+    df = _normalise_columns(pd.read_csv(path))
+    value_df = df.iloc[:, 1:].copy()
+    value_df.columns = [str(col) for col in value_df.columns]
+    value_df = value_df.apply(pd.to_numeric, errors="coerce")
+
+    if time_index is not None and len(time_index) == len(value_df):
+        value_df.index = time_index
+        value_df.index.name = "timestamp"
+    else:
+        index_values = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        if not index_values.isna().all():
+            value_df.index = pd.DatetimeIndex(index_values)
+            value_df.index.name = str(df.columns[0])
+        else:
+            value_df.index = pd.Index(df.iloc[:, 0], name=str(df.columns[0]))
+
+    if isinstance(value_df.index, pd.DatetimeIndex):
+        value_df = value_df.sort_index()
+    return value_df
+
+
 def load_occupancy(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
     """Return occupancy DataFrame, index=DatetimeIndex, columns=node_id."""
     occ_path = raw_dir / "occupancy.csv"
@@ -35,9 +89,7 @@ def load_occupancy(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
             f"Occupancy file not found: {occ_path}\n"
             "Please download ST-EVCDP and place files under data/raw/st_evcdp/."
         )
-    df = pd.read_csv(occ_path, index_col=0, parse_dates=True)
-    df = df.sort_index()
-    return df
+    return _read_aligned_timeseries(occ_path, time_index=_load_time_index(raw_dir))
 
 
 def _ensure_cached_node_ids(cached: dict, raw_dir: Path) -> dict:
@@ -52,29 +104,141 @@ def _ensure_cached_node_ids(cached: dict, raw_dir: Path) -> dict:
     return cached
 
 
-def load_node_meta(raw_dir: Path = RAW_DIR) -> pd.DataFrame:
-    """Return node metadata DataFrame, index=node_id."""
-    path = raw_dir / "nodes.csv"
+def load_price(raw_dir: Path = RAW_DIR, timestamps=None) -> pd.DataFrame:
+    path = raw_dir / "price.csv"
     if not path.exists():
-        return pd.DataFrame()  # allow graceful degradation
-    df = pd.read_csv(path, index_col=0)
+        return pd.DataFrame()
+
+    df = _read_aligned_timeseries(path, time_index=_load_time_index(raw_dir))
+    if timestamps is not None and isinstance(df.index, pd.DatetimeIndex):
+        ts_index = pd.DatetimeIndex(timestamps)
+        df = df.reindex(ts_index)
+        df = df.ffill().bfill()
     return df
 
 
-def load_adjacency(raw_dir: Path = RAW_DIR, n_nodes: int | None = None) -> np.ndarray:
+def load_weather(raw_dir: Path = RAW_DIR, timestamps=None) -> pd.DataFrame:
+    xls_path = raw_dir / "SZweather20220619-20220718.xls"
+    if not xls_path.exists():
+        csv_path = raw_dir / "weather.csv"
+        if not csv_path.exists():
+            return pd.DataFrame()
+        weather = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        weather.columns = [str(col) for col in weather.columns]
+        weather = weather.sort_index()
+    else:
+        try:
+            weather = pd.read_excel(xls_path)
+        except Exception:
+            return pd.DataFrame()
+
+        weather = _normalise_columns(weather)
+        time_col = weather.columns[0]
+        weather = weather.rename(
+            columns={
+                time_col: "timestamp",
+                "T": "temperature",
+                "U": "humidity",
+                "P": "pressure",
+                "P0": "station_pressure",
+                "Td": "dew_point",
+            }
+        )
+        weather["timestamp"] = pd.to_datetime(
+            weather["timestamp"],
+            dayfirst=True,
+            errors="coerce",
+        )
+        weather = weather.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
+        keep_cols = [
+            col
+            for col in ("temperature", "humidity", "pressure", "station_pressure", "dew_point")
+            if col in weather.columns
+        ]
+        weather = weather[keep_cols].apply(pd.to_numeric, errors="coerce")
+
+    if timestamps is not None and isinstance(weather.index, pd.DatetimeIndex):
+        ts_index = pd.DatetimeIndex(timestamps)
+        weather = weather.reindex(ts_index, method="ffill").bfill()
+    return weather
+
+
+def load_node_meta(raw_dir: Path = RAW_DIR, node_ids: list[str] | None = None) -> pd.DataFrame:
+    """Return node metadata DataFrame, index=node_id."""
+    path = raw_dir / "nodes.csv"
+    if not path.exists():
+        info_path = raw_dir / "information.csv"
+        if not info_path.exists():
+            return pd.DataFrame()  # allow graceful degradation
+
+        df = _normalise_columns(pd.read_csv(info_path))
+        rename_map = {
+            "grid": "node_id",
+            "count": "capacity",
+            "lon": "lon",
+            "la": "lat",
+            "CBD": "cbd_flag",
+        }
+        df = df.rename(columns={src: dst for src, dst in rename_map.items() if src in df.columns})
+        if "node_id" in df.columns:
+            df["node_id"] = df["node_id"].astype(str)
+            df = df.set_index("node_id")
+        if "cbd_flag" in df.columns:
+            cbd_flag = pd.to_numeric(df["cbd_flag"], errors="coerce").fillna(0)
+            df["zone_type"] = np.where(cbd_flag > 0, "CBD", "Residential")
+        if node_ids is not None:
+            df = df.reindex([str(node_id) for node_id in node_ids])
+        return df
+
+    df = pd.read_csv(path, index_col=0)
+    df.index = df.index.map(str)
+    if node_ids is not None:
+        df = df.reindex([str(node_id) for node_id in node_ids])
+    return df
+
+
+def load_adjacency(
+    raw_dir: Path = RAW_DIR,
+    n_nodes: int | None = None,
+    node_ids: list[str] | None = None,
+) -> np.ndarray:
     """Return adjacency matrix as (N, N) ndarray."""
     npy_path = raw_dir / "adjacency.npy"
-    csv_path = raw_dir / "adjacency.csv"
     if npy_path.exists():
         return np.load(npy_path)
-    if csv_path.exists():
-        df = pd.read_csv(csv_path)
-        if n_nodes is None:
-            n_nodes = max(df["src"].max(), df["dst"].max()) + 1
-        adj = np.zeros((n_nodes, n_nodes), dtype=np.float32)
-        for _, row in df.iterrows():
-            adj[int(row["src"]), int(row["dst"])] = float(row.get("weight", 1.0))
-        return adj
+
+    for csv_path in (raw_dir / "adjacency.csv", raw_dir / "adj.csv"):
+        if not csv_path.exists():
+            continue
+
+        df = _normalise_columns(pd.read_csv(csv_path))
+        lowered = {str(col).lower(): col for col in df.columns}
+        if {"src", "dst"}.issubset(lowered):
+            if n_nodes is None:
+                n_nodes = max(df[lowered["src"]].max(), df[lowered["dst"]].max()) + 1
+            adj = np.zeros((n_nodes, n_nodes), dtype=np.float32)
+            for _, row in df.iterrows():
+                adj[int(row[lowered["src"]]), int(row[lowered["dst"]])] = float(row.get(lowered.get("weight"), 1.0))
+            return adj
+
+        first_col = str(df.columns[0]).lower()
+        if first_col in {"node_id", "grid", "id"} and df.shape[1] > 1:
+            row_ids = df.iloc[:, 0].astype(str)
+            mat_df = df.iloc[:, 1:].copy()
+            mat_df.index = row_ids
+            mat_df.columns = [str(col) for col in mat_df.columns]
+            if node_ids is not None:
+                ordered = [str(node_id) for node_id in node_ids]
+                if set(ordered).issubset(mat_df.index) and set(ordered).issubset(mat_df.columns):
+                    mat_df = mat_df.loc[ordered, ordered]
+            mat = mat_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+            if mat.shape[0] == mat.shape[1]:
+                return mat
+
+        mat = df.apply(pd.to_numeric, errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        if mat.shape[0] == mat.shape[1]:
+            return mat
+
     # fallback: identity
     if n_nodes:
         return np.eye(n_nodes, dtype=np.float32)
@@ -113,7 +277,10 @@ def load_st_evcdp(
             return _ensure_cached_node_ids(pickle.load(f), raw_dir)
 
     df = load_occupancy(raw_dir)
-    node_meta = load_node_meta(raw_dir)
+    node_ids = [str(col) for col in df.columns]
+    node_meta = load_node_meta(raw_dir, node_ids=node_ids)
+    price = load_price(raw_dir, timestamps=df.index)
+    weather = load_weather(raw_dir, timestamps=df.index)
 
     T, N = df.shape
     occ_raw = df.values.astype(np.float32)
@@ -125,15 +292,17 @@ def load_st_evcdp(
 
     occ_norm, vmin, vmax = normalize(occ_raw)
 
-    adj = load_adjacency(raw_dir, n_nodes=N)
+    adj = load_adjacency(raw_dir, n_nodes=N, node_ids=node_ids)
 
     result = {
         "occupancy": occ_norm,
         "occupancy_raw": occ_raw,
         "timestamps": df.index,
-        "node_ids": [str(c) for c in df.columns],
+        "node_ids": node_ids,
         "node_meta": node_meta,
         "adj": adj,
+        "price": price,
+        "weather": weather,
         "norm_min": vmin,
         "norm_max": vmax,
     }

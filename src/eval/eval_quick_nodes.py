@@ -171,7 +171,10 @@ def main():
             if args.use_rag and retriever is not None:
                 retrieved = retriever.query(sample, exclude_t_start=None)
                 diff = compute_diff_features(
-                    query_sample=sample, retrieved_samples=retrieved)
+                    query_sample=sample,
+                    retrieved_samples=retrieved,
+                    node_idx=node_idx,
+                )
                 if args.use_diff_dora:
                     set_diff_context(torch.tensor([
                         float(diff.get("diff_occ", 0.0) or 0.0),

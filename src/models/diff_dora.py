@@ -85,7 +85,7 @@ class DiffDoRAModel(nn.Module):
     Usage
     -----
     diff_model = DiffDoRAModel(peft_dora_model, diff_input_dim=3)
-    set_diff_context(diff_tensor)   # shape (diff_input_dim,)
+    set_diff_context(diff_tensor)   # shape (diff_input_dim,) or (batch, diff_input_dim)
     output = diff_model(**inputs)
     """
 
@@ -97,8 +97,8 @@ class DiffDoRAModel(nn.Module):
         scale: float = 0.5,
     ):
         super().__init__()
-        self.peft_model  = peft_model
-        self.controller  = DiffController(diff_input_dim, hidden_dim, scale)
+        self.peft_model = peft_model
+        self.controller = DiffController(diff_input_dim, hidden_dim, scale)
         self._patched_layers: list[tuple[nn.Module, Any]] = []
         self._patch_dora_layers()
 
@@ -106,8 +106,20 @@ class DiffDoRAModel(nn.Module):
         diff_vec = get_diff_context()
         if diff_vec is None:
             return None
-        gate = self.controller(diff_vec.to(device=device))
-        return (1.0 + gate.squeeze()).to(device=device, dtype=dtype)
+        diff_vec = diff_vec.to(device=device)
+        gate = self.controller(diff_vec)
+        return (1.0 + gate.squeeze(-1)).to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _broadcast_mag_norm_scale(scale_factor: torch.Tensor, dora_layer: nn.Module, weight_norm: torch.Tensor, base_result: torch.Tensor) -> torch.Tensor:
+        base_mag = (dora_layer.weight / weight_norm).to(dtype=base_result.dtype)
+        if scale_factor.ndim == 0:
+            return (base_mag * scale_factor).view(*([1] * (base_result.dim() - 1)), -1)
+
+        # One gate per sample; broadcast across sequence/time dims and output channels.
+        base_view = (1,) + (1,) * max(base_result.dim() - 2, 0) + (-1,)
+        sample_view = (-1,) + (1,) * max(base_result.dim() - 2, 0) + (1,)
+        return base_mag.view(*base_view) * scale_factor.view(*sample_view)
 
     def _patch_dora_layers(self):
         for module in self.peft_model.modules():
@@ -133,7 +145,6 @@ class DiffDoRAModel(nn.Module):
             lora_B = kwargs["lora_B"]
             scaling = kwargs["scaling"]
             base_layer = kwargs["base_layer"]
-            magnitude = dora_layer.weight * scale_factor
 
             # Linear path: this is the one used by Qwen target modules.
             if "embed_fn" not in kwargs and not hasattr(dora_layer, "conv_fn"):
@@ -142,7 +153,6 @@ class DiffDoRAModel(nn.Module):
                 lora_weight = lora_B(lora_A(x_eye)).T
                 weight = dequantize_module_weight(base_layer).to(x.dtype)
                 weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
-                mag_norm_scale = (magnitude / weight_norm).view(1, -1)
 
                 lora_result = lora_B(lora_A(x))
                 if base_result is not None:
@@ -152,44 +162,11 @@ class DiffDoRAModel(nn.Module):
                 else:
                     base_result = F.linear(x, transpose(weight, dora_layer.fan_in_fan_out))
 
+                mag_norm_scale = outer._broadcast_mag_norm_scale(scale_factor, dora_layer, weight_norm, base_result)
                 return (mag_norm_scale - 1) * base_result + mag_norm_scale * lora_result * scaling
 
-            # Embedding path for completeness.
-            if "embed_fn" in kwargs:
-                embed_fn = kwargs["embed_fn"]
-                lora_weight = (lora_A @ lora_B).T
-                weight = base_layer.weight
-                weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
-                mag_norm_scale = magnitude / weight_norm
-                result_dora = mag_norm_scale * (embed_fn(x, lora_A) @ lora_B) * scaling
-                return mag_norm_scale, result_dora
-
-            # Conv path for completeness.
-            base_result = kwargs.get("base_result")
-            weight = base_layer.weight
-            r = lora_A.weight.shape[0]
-            lora_weight = torch.mm(lora_B.weight.view([-1, r]), lora_A.weight.view([r, -1]))
-            lora_weight = lora_weight.reshape(weight.shape)
-            weight_norm = dora_layer.get_weight_norm(weight, lora_weight.detach(), scaling).detach()
-            mag_norm_scale = magnitude / weight_norm
-
-            if base_result is None:
-                base_result = dora_layer.conv_fn(
-                    x,
-                    weight,
-                    bias=None,
-                    stride=base_layer.stride,
-                    padding=base_layer.padding,
-                    dilation=base_layer.dilation,
-                    groups=base_layer.groups,
-                )
-            else:
-                bias = base_layer.bias
-                if bias is not None:
-                    bias_shape = (1, -1) + (1,) * (base_result.dim() - 2)
-                    base_result = base_result - bias.view(*bias_shape)
-
-            return (mag_norm_scale - 1) * base_result + mag_norm_scale * lora_B(lora_A(x)) * scaling
+            # Embedding / conv paths are not used by the current Qwen target modules.
+            return original_forward(x, *args, **kwargs)
 
         dora_layer.forward = forward_with_diff
         dora_layer._diffdora_original_forward = original_forward

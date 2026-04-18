@@ -143,8 +143,8 @@ source .venv/bin/activate
 python -m src.eval.eval_moe_routed \
   --dataset st_evcdp \
   --horizon 6 \
-  --expert_0_dir outputs/moe_experts_h6/expert_0/adapter \
-  --expert_1_dir outputs/moe_experts_h6/expert_1/adapter \
+  --expert_0_dir outputs/st_evcdp_moe_diffdora_h6/expert_0/adapter \
+  --expert_1_dir outputs/st_evcdp_moe_diffdora_h6/expert_1/adapter \
   --use_rag
 ```
 
@@ -218,3 +218,49 @@ python -m src.eval.validate_saved_adapter \
 
 - NVIDIA 官方 CUDA Linux 安装文档支持 `Ubuntu 22.04 LTS`
 - PyTorch 官方历史安装页提供了 Linux `CUDA 12.1` 的 wheel 方案
+
+
+## 11. 修复版 Expert Ablation 复现命令
+
+下面这条命令用于重新验证并修复 `wo_dora > full` 的偏差问题。
+
+特点：
+
+- 使用修复后的 `DiffDoRA` batch 条件化
+- 所有变体统一导出 best snapshot
+- 使用新的输出目录，保留旧结果作为对照
+- 评测协议固定为 `max_eval=60`、`12 CBD + 12 Residential`、`max_new_tokens=512`、`infer_batch_size=12`
+
+```bash
+cd /root/Diff-DoRA
+source .venv/bin/activate
+
+python -m src.eval.eval_paper_ablation \
+  --dataset st_evcdp \
+  --horizon 6 \
+  --use_rag \
+  --retrieval_cache data/retrieval_cache/st_evcdp_h6.pkl \
+  --max_eval 60 \
+  --sampling random \
+  --seed 42 \
+  --node_sampling balanced_random \
+  --max_nodes_per_domain 12 \
+  --max_new_tokens 512 \
+  --infer_batch_size 12 \
+  --skip_base_model \
+  --full_expert_0_dir outputs/ablation_expert_st_evcdp_h6_fixed/full/expert_0/adapter \
+  --full_expert_1_dir outputs/ablation_expert_st_evcdp_h6_fixed/full/expert_1/adapter \
+  --wo_cot_expert_0_dir outputs/ablation_expert_st_evcdp_h6_fixed/wo_cot/expert_0/adapter \
+  --wo_cot_expert_1_dir outputs/ablation_expert_st_evcdp_h6_fixed/wo_cot/expert_1/adapter \
+  --wo_dora_expert_0_dir outputs/ablation_expert_st_evcdp_h6_fixed/wo_dora/expert_0/adapter \
+  --wo_dora_expert_1_dir outputs/ablation_expert_st_evcdp_h6_fixed/wo_dora/expert_1/adapter \
+  --output outputs/ablation_expert_st_evcdp_h6_fixed/expert_ablation.json
+```
+
+一键重训 + 重评 + 重新作图则使用：
+
+```bash
+cd /root/Diff-DoRA
+source .venv/bin/activate
+bash scripts/run_ablation_expert_only.sh st_evcdp 6
+```

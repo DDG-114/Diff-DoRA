@@ -30,7 +30,7 @@ LOADERS = {
 }
 
 
-def build_and_save(dataset: str, horizon: int) -> Path:
+def build_and_save(dataset: str, horizon: int, output_path: Path | None = None) -> Path:
     print(f"\n[build_cache] {dataset}  horizon={horizon}")
     t0 = time.time()
 
@@ -48,7 +48,7 @@ def build_and_save(dataset: str, horizon: int) -> Path:
 
     retriever = KNNRetriever(train_samples, top_k=2)
 
-    out_path = CACHE_DIR / f"{dataset}_h{horizon}.pkl"
+    out_path = output_path or CACHE_DIR / f"{dataset}_h{horizon}.pkl"
     retriever.save(out_path)
 
     elapsed = time.time() - t0
@@ -61,14 +61,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", default=["st_evcdp", "urbanev"])
     parser.add_argument("--horizons", nargs="+", type=int, default=[3, 6, 9, 12])
+    parser.add_argument(
+        "--output_path",
+        default="",
+        help="Explicit output path. Requires exactly one dataset and one horizon.",
+    )
     args = parser.parse_args()
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if args.output_path and (len(args.datasets) != 1 or len(args.horizons) != 1):
+        raise ValueError("--output_path requires exactly one dataset and one horizon.")
 
     saved = []
     for ds in args.datasets:
         for h in args.horizons:
-            path = build_and_save(ds, h)
+            explicit_output = Path(args.output_path) if args.output_path else None
+            path = build_and_save(ds, h, output_path=explicit_output)
             saved.append(path)
 
     print(f"\n✅  Built {len(saved)} retrieval cache(s):")

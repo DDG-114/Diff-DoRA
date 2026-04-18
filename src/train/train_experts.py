@@ -19,21 +19,21 @@ import time
 from pathlib import Path
 
 import torch
-from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
+from transformers import DataCollatorForSeq2Seq, Trainer, TrainerCallback, TrainingArguments
 
 from src.data.load_st_evcdp   import load_st_evcdp
 from src.data.load_urbanev    import load_urbanev
 from src.data.build_splits    import build_splits
 from src.data.build_samples   import build_samples
-from src.utils.node_context   import extract_node_static_context
+from src.utils.node_context   import extract_node_static_context, resolve_node_id
 from src.eval.metrics         import per_horizon_metrics
 from src.models.qwen_peft     import load_model_and_tokenizer, get_lora_model, load_peft_model, generate
 from src.models.diff_dora     import DiffDoRAModel, set_diff_context
-from src.prompts.prompt_vanilla import build_vanilla_prompt
+from src.prompts.prompt_vanilla import build_direct_physical_prompt, build_vanilla_prompt
 from src.prompts.prompt_cot   import build_cot_prompt
 from src.prompts.parser       import parse_output
 from src.retrieval.knn_retriever import KNNRetriever
-from src.retrieval.diff_features import compute_diff_features
+from src.retrieval.diff_features import compute_diff_features, format_diff_block
 from src.routing.build_labels import build_routing_labels
 from src.routing.hard_router  import HardRouter
 from src.train.train_single   import EVDataset   # re-use dataset class
@@ -45,14 +45,203 @@ class DiffDoRATrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         diff_vec = inputs.pop("diff_vec", None)
         if isinstance(diff_vec, torch.Tensor):
-            if diff_vec.ndim == 2:
-                diff_ctx = diff_vec.float().mean(dim=0)
-            else:
-                diff_ctx = diff_vec.float().view(-1)
-            set_diff_context(diff_ctx.detach())
+            set_diff_context(diff_vec.detach().float())
         else:
             set_diff_context(None)
         return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+
+class BestExpertSnapshotCallback(TrainerCallback):
+    """Persist the best adapter/controller snapshot without full Trainer checkpoints."""
+
+    def __init__(self, *, peft_model, tokenizer, adapter_dir: Path, controller_getter=None):
+        self.peft_model = peft_model
+        self.tokenizer = tokenizer
+        self.adapter_dir = adapter_dir
+        self.controller_getter = controller_getter
+        self.best_metric: float | None = None
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.adapter_dir.parent / "best_snapshot.json"
+
+    @property
+    def controller_path(self) -> Path:
+        return self.adapter_dir.parent / "diff_controller.pt"
+
+    def _write_snapshot(self, *, metric: float | None, state, reason: str):
+        self.adapter_dir.mkdir(parents=True, exist_ok=True)
+        self.peft_model.save_pretrained(str(self.adapter_dir))
+        self.tokenizer.save_pretrained(str(self.adapter_dir))
+        if self.controller_getter is not None:
+            controller = self.controller_getter()
+            if controller is not None:
+                torch.save(controller.state_dict(), self.controller_path)
+
+        payload = {
+            "best_eval_loss": metric,
+            "global_step": getattr(state, "global_step", None),
+            "epoch": float(getattr(state, "epoch", 0.0) or 0.0),
+            "reason": reason,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(self.metadata_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        if metric is not None:
+            self.best_metric = metric
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        metric = None if metrics is None else metrics.get("eval_loss")
+        if metric is None:
+            return control
+        metric = float(metric)
+        if self.best_metric is None or metric < self.best_metric:
+            self._write_snapshot(metric=metric, state=state, reason="eval_improved")
+        return control
+
+    def ensure_snapshot(self, state, reason: str = "train_end_fallback"):
+        if not self.adapter_dir.exists():
+            self._write_snapshot(metric=self.best_metric, state=state, reason=reason)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.ensure_snapshot(state)
+        return control
+
+
+def _resolve_prompt_style(prompt_style: str, has_retrieval: bool) -> str:
+    if prompt_style == "auto":
+        return "cot" if has_retrieval else "vanilla"
+    if prompt_style in {"cot", "direct_physical"} and not has_retrieval:
+        raise ValueError(
+            f"prompt_style={prompt_style!r} requires retrieval context, but no retriever was available."
+        )
+    return prompt_style
+
+
+def _weather_at(weather, t_start: int) -> dict | None:
+    if weather is None or getattr(weather, "empty", True):
+        return None
+    idx = min(max(int(t_start) + 11, 0), len(weather) - 1)
+    row = weather.iloc[idx]
+    if hasattr(row, "to_dict"):
+        d = row.to_dict()
+        for k in list(d.keys()):
+            lk = str(k).lower()
+            if "temp" in lk and "temperature" not in d:
+                d["temperature"] = d[k]
+            if "humid" in lk and "humidity" not in d:
+                d["humidity"] = d[k]
+        return d
+    return None
+
+
+def _price_at(price, t_start: int, node_idx: int, *, node_ids=None, node_meta=None) -> float | None:
+    if price is None or getattr(price, "empty", True):
+        return None
+    idx = min(max(int(t_start) + 11, 0), len(price) - 1)
+    row = price.iloc[idx]
+    node_id = resolve_node_id(node_idx, node_ids=node_ids, node_meta=node_meta)
+    if hasattr(row, "item") and not hasattr(row, "to_dict"):
+        return float(row.item())
+    if hasattr(row, "to_dict"):
+        d = row.to_dict()
+        if node_id in d:
+            return float(d[node_id])
+        if str(node_id) in d:
+            return float(d[str(node_id)])
+        if node_idx in d:
+            return float(d[node_idx])
+        if str(node_idx) in d:
+            return float(d[str(node_idx)])
+        vals = [float(v) for v in d.values() if v is not None]
+        if vals:
+            return float(sum(vals) / len(vals))
+    return None
+
+
+def _compute_retrieval_diff(sample: dict, retrieved: list[dict], splits: dict, node_idx: int) -> dict:
+    weather_current = _weather_at(splits.get("weather"), sample.get("t_start", 0))
+    weather_retrieved = [_weather_at(splits.get("weather"), rs.get("t_start", 0)) for rs in retrieved]
+    price_current = _price_at(
+        splits.get("price"),
+        sample.get("t_start", 0),
+        node_idx,
+        node_ids=splits.get("node_ids"),
+        node_meta=splits.get("node_meta"),
+    )
+    price_retrieved = [
+        _price_at(
+            splits.get("price"),
+            rs.get("t_start", 0),
+            node_idx,
+            node_ids=splits.get("node_ids"),
+            node_meta=splits.get("node_meta"),
+        )
+        for rs in retrieved
+    ]
+    return compute_diff_features(
+        query_sample=sample,
+        retrieved_samples=retrieved,
+        weather_current=weather_current,
+        weather_retrieved=weather_retrieved,
+        price_current=price_current,
+        price_retrieved=price_retrieved,
+        node_idx=node_idx,
+    )
+
+
+def _diff_tensor_from_features(diff: dict | None) -> torch.Tensor:
+    if diff is None:
+        return torch.zeros(3, dtype=torch.float32)
+    return torch.tensor([
+        float(diff.get("diff_occ", 0.0) or 0.0),
+        float(diff.get("diff_temp", 0.0) or 0.0),
+        float(diff.get("diff_price", 0.0) or 0.0),
+    ], dtype=torch.float32)
+
+
+def _build_eval_prompt(sample, node_idx: int, splits: dict, args, retriever: KNNRetriever | None, domain_name: str):
+    static_context = extract_node_static_context(
+        node_idx,
+        node_ids=splits.get("node_ids"),
+        node_meta=splits.get("node_meta"),
+    )
+    retrieved = []
+    diff = None
+    if args.use_rag and retriever is not None:
+        retrieved = retriever.query(sample, exclude_t_start=None)
+        diff = _compute_retrieval_diff(sample, retrieved, splits, node_idx)
+
+    prompt_style = _resolve_prompt_style(args.prompt_style, bool(retrieved) and diff is not None)
+    if prompt_style == "cot":
+        sys_msg, usr_msg = build_cot_prompt(
+            sample,
+            retrieved,
+            diff,
+            node_idx,
+            args.horizon,
+            domain_label=domain_name,
+            static_context=static_context,
+        )
+    elif prompt_style == "direct_physical":
+        sys_msg, usr_msg = build_direct_physical_prompt(
+            sample,
+            retrieved,
+            format_diff_block(diff),
+            node_idx=node_idx,
+            horizon=args.horizon,
+            domain_label=domain_name,
+            static_context=static_context,
+        )
+    else:
+        sys_msg, usr_msg = build_vanilla_prompt(
+            sample,
+            node_idx,
+            args.horizon,
+            domain_label=domain_name,
+            static_context=static_context,
+        )
+    return sys_msg, usr_msg, _diff_tensor_from_features(diff)
 
 
 def train_one_expert(
@@ -108,6 +297,7 @@ def train_one_expert(
         node_ids=node_ids,
         poi=poi,
         include_diff_vec=args.use_diff_dora,
+        prompt_style=args.prompt_style,
     )
     
     val_ds = EVDataset(
@@ -124,11 +314,17 @@ def train_one_expert(
         node_ids=node_ids,
         poi=poi,
         include_diff_vec=args.use_diff_dora,
+        prompt_style=args.prompt_style,
     )
 
     collator = DataCollatorForSeq2Seq(tokenizer, model=peft_model, padding=True, pad_to_multiple_of=8)
-    save_strategy = "no" if args.use_diff_dora else "steps"
-    load_best = False if args.use_diff_dora else True
+    adapter_dir = out_dir / f"expert_{expert_id}" / "adapter"
+    best_snapshot_cb = BestExpertSnapshotCallback(
+        peft_model=peft_model,
+        tokenizer=tokenizer,
+        adapter_dir=adapter_dir,
+        controller_getter=(lambda: getattr(model_for_training, "controller", None)) if args.use_diff_dora else None,
+    )
     training_args = TrainingArguments(
         output_dir=str(out_dir / f"expert_{expert_id}" / "checkpoints"),
         num_train_epochs=args.epochs,
@@ -139,11 +335,8 @@ def train_one_expert(
         logging_steps=20,
         eval_strategy="steps",
         eval_steps=25,
-        save_strategy=save_strategy,
-        save_steps=25,
-        load_best_model_at_end=load_best,
-        metric_for_best_model="loss",
-        greater_is_better=False,
+        save_strategy="no",
+        load_best_model_at_end=False,
         report_to="none",
         dataloader_num_workers=0,
         remove_unused_columns=False,
@@ -155,17 +348,14 @@ def train_one_expert(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         data_collator=collator,
+        callbacks=[best_snapshot_cb],
     )
     trainer.label_names = ["labels"]
     trainer.train()
-    save_path = str(out_dir / f"expert_{expert_id}" / "adapter")
-    peft_model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
-    if args.use_diff_dora and hasattr(model_for_training, "controller"):
-        torch.save(
-            model_for_training.controller.state_dict(),
-            out_dir / f"expert_{expert_id}" / "diff_controller.pt",
-        )
+    best_snapshot_cb.ensure_snapshot(trainer.state, reason="post_train_fallback")
+    save_path = str(adapter_dir)
+    if best_snapshot_cb.best_metric is not None:
+        print(f"  Best eval_loss: {best_snapshot_cb.best_metric:.5f}")
     print(f"Expert {expert_id} saved → {save_path}")
     del trainer
     del collator
@@ -221,56 +411,28 @@ def evaluate_one_expert(
     domain_name = "CBD" if expert_id == 0 else "Residential"
     bar = tqdm(total=total_calls, desc=f"  Expert {expert_id} ({domain_name})",
                unit="call", ncols=90, leave=True)
-    for si, s in enumerate(test_samples[:eval_cap]):
-        for n in nodes[:n_nodes]:
-            if args.use_rag and retriever is not None:
-                retrieved = retriever.query(s, exclude_t_start=None)
-                diff = compute_diff_features(query_sample=s, retrieved_samples=retrieved)
-                static_context = extract_node_static_context(
-                    n,
-                    node_ids=splits.get("node_ids"),
-                    node_meta=splits.get("node_meta"),
-                )
-                domain_label = domain_name
-                if args.use_diff_dora:
-                    set_diff_context(torch.tensor([
-                        float(diff.get("diff_occ", 0.0) or 0.0),
-                        float(diff.get("diff_temp", 0.0) or 0.0),
-                        float(diff.get("diff_price", 0.0) or 0.0),
-                    ], dtype=torch.float32))
-                sys_msg, usr_msg = build_cot_prompt(
-                    s,
-                    retrieved,
-                    diff,
-                    n,
-                    args.horizon,
-                    domain_label=domain_label,
-                    static_context=static_context,
-                )
-            else:
-                static_context = extract_node_static_context(
-                    n,
-                    node_ids=splits.get("node_ids"),
-                    node_meta=splits.get("node_meta"),
-                )
-                if args.use_diff_dora:
-                    set_diff_context(torch.zeros(3, dtype=torch.float32))
-                sys_msg, usr_msg = build_vanilla_prompt(
-                    s,
-                    n,
-                    args.horizon,
-                    domain_label=domain_name,
-                    static_context=static_context,
-                )
-            out = generate(eval_model, tokenizer, sys_msg, usr_msg, max_new_tokens=128)
+    for sample in test_samples[:eval_cap]:
+        for node_idx in nodes[:n_nodes]:
+            sys_msg, usr_msg, diff_vec = _build_eval_prompt(
+                sample,
+                node_idx,
+                splits,
+                args,
+                retriever,
+                domain_name,
+            )
+            if args.use_diff_dora:
+                set_diff_context(diff_vec)
+            out = generate(eval_model, tokenizer, sys_msg, usr_msg, max_new_tokens=256)
+            if args.use_diff_dora:
+                set_diff_context(None)
             arr = parse_output(out, args.horizon)
             ok = arr is not None and len(arr) == args.horizon
             if ok:
                 preds.append(arr)
-                trues.append(s["y"][:args.horizon, n])
+                trues.append(sample["y"][:args.horizon, node_idx])
             bar.update(1)
-            bar.set_postfix(parsed=len(preds), node=n,
-                            ok="✓" if ok else "✗", refresh=False)
+            bar.set_postfix(parsed=len(preds), node=node_idx, ok="✓" if ok else "✗", refresh=False)
     bar.close()
 
     del eval_model
@@ -297,7 +459,7 @@ def main():
     parser.add_argument("--horizon",    type=int,   default=6)
     parser.add_argument("--output_dir", default="outputs/moe_experts_h6")
     parser.add_argument("--epochs",     type=int,   default=2)
-    parser.add_argument("--batch_size", type=int,   default=8)
+    parser.add_argument("--batch_size", type=int,   default=16)
     parser.add_argument("--lr",         type=float, default=2e-4)
     parser.add_argument("--lora_rank",  type=int, default=32,
                         help="LoRA rank; the paper uses 32.")
@@ -314,6 +476,8 @@ def main():
     parser.add_argument("--diff_scale", type=float, default=0.5)
     parser.add_argument("--use_rag",    action="store_true",
                         help="Enable retrieval-augmented CoT prompts for expert training/eval")
+    parser.add_argument("--prompt_style", choices=sorted(EVDataset.PROMPT_STYLES), default="auto",
+                        help="Prompt supervision style: auto preserves current behavior; direct_physical enables w/o-CoT training.")
     parser.add_argument("--max_length", type=int, default=2560,
                         help="Tokenization max length; the paper uses 2560.")
     parser.add_argument("--grad_accum", type=int, default=1,
@@ -335,6 +499,9 @@ def main():
 
     if args.use_diff_dora and not args.use_dora:
         raise ValueError("--use_diff_dora requires --use_dora")
+
+    if args.prompt_style in {"cot", "direct_physical"} and not args.use_rag:
+        raise ValueError("--prompt_style cot/direct_physical requires --use_rag")
 
     import os
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -419,29 +586,32 @@ def main():
         )
 
     # 6. Evaluate both experts on test split
-    test_map = build_samples(
-        splits["test"], splits["timestamps_test"],
-        adj=splits.get("adj"),
-        horizons=[args.horizon],
-        history_len=args.history_len,
-        neighbor_k=args.neighbor_k,
-    )
-    test_samples = test_map[args.horizon]
     results = {}
-    for eid in (0, 1):
-        m = evaluate_one_expert(
-            eid,
-            trained[eid],
-            tokenizer,
-            test_samples,
-            router,
-            splits,
-            args,
-            retriever=retrievers[eid],  # Use per-expert retriever for evaluation
+    if args.eval_max_samples > 0 and args.eval_nodes_per_expert > 0:
+        test_map = build_samples(
+            splits["test"], splits["timestamps_test"],
+            adj=splits.get("adj"),
+            horizons=[args.horizon],
+            history_len=args.history_len,
+            neighbor_k=args.neighbor_k,
         )
-        if m is not None:
-            results[f"expert_{eid}"] = m
-            print(f"Expert {eid}: {m['overall']}")
+        test_samples = test_map[args.horizon]
+        for eid in (0, 1):
+            m = evaluate_one_expert(
+                eid,
+                trained[eid],
+                tokenizer,
+                test_samples,
+                router,
+                splits,
+                args,
+                retriever=retrievers[eid],
+            )
+            if m is not None:
+                results[f"expert_{eid}"] = m
+                print(f"Expert {eid}: {m['overall']}")
+    else:
+        print("Skipping post-training quick evaluation (eval_max_samples<=0 or eval_nodes_per_expert<=0).")
 
     with open(out_dir / "metrics.json", "w") as f:
         json.dump({
@@ -461,6 +631,7 @@ def main():
                 "use_dora": args.use_dora,
                 "use_diff_dora": args.use_diff_dora,
                 "use_rag": args.use_rag,
+                "prompt_style": args.prompt_style,
             },
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         }, f, indent=2)
