@@ -15,26 +15,23 @@ import numpy as np
 
 from src.prompts.prompt_vanilla import (
     _format_series,
+    _task_profile,
+    build_system_message,
     constant_forecast_instruction,
+    format_long_history_block,
+    format_auxiliary_feature_block,
+    format_neighbour_context_line,
+    format_retrieved_examples,
     format_static_context,
     format_trend_block,
     summarize_trend_context,
 )
 from src.retrieval.diff_features import format_diff_block
 
-COT_SYSTEM_MSG = (
-    "You are an expert EV charging demand forecaster. "
-    "You will reason step by step through three stages: "
-    "(1) Gap Analysis, (2) Spatial Logic, (3) Numerical Prediction. "
-    "Always end with exactly:\n"
-    "Numerical Prediction: [v1, v2, ..., vH]\n"
-    "where H is the forecast horizon."
-)
-
 COT_TARGET_TEMPLATE = """\
 ## Stage 1 – Gap Analysis
-Current mean occupancy: {curr_occ:.3f}
-Retrieved mean occupancy: {retr_occ:.3f}
+Current mean {series_label}: {curr_occ:.3f}
+Retrieved mean {series_label}: {retr_occ:.3f}
 Current last value: {curr_last:.3f}
 Current short-term slope: {curr_short:+.3f}
 Current medium-term slope: {curr_medium:+.3f}
@@ -42,12 +39,12 @@ Retrieved last value: {retr_last:.3f}
 Retrieved short-term slope: {retr_short:+.3f}
 Current recent trend: {curr_trend}
 Retrieved recent trend: {retr_trend}
-{diff_block}
+{env_diff_line}\
 The gap suggests {gap_desc}.
 Trend comparison: {trend_desc}.
 
 ## Stage 2 – Spatial Logic
-{static_block}Neighbour mean occupancy (last step): {nbr_occ:.3f}
+{static_block}Neighbour mean {series_label} (last step): {nbr_occ:.3f}
 Spatial influence: {spatial_desc}.
 
 ## Stage 3 – Numerical Prediction
@@ -61,11 +58,12 @@ Numerical Prediction: {pred_list}"""
 def build_cot_prompt(
     sample: dict,
     retrieved_samples: list[dict],
-    diff_features: dict,
+    diff_features: dict | None,
     node_idx: int = 0,
     horizon: int = 6,
     domain_label: str | None = None,
     static_context: dict | None = None,
+    include_env_diff: bool = False,
 ) -> tuple[str, str]:
     """
     Build (system_msg, user_msg) including retrieved context, diff features, and optional domain label.
@@ -74,27 +72,44 @@ def build_cot_prompt(
     as described in the LR-MoE paper: "In the inference phase, the model activates the corresponding
     expert based on the metadata label in the input prompt."
     """
-    x = sample["x_hist"][:, node_idx]   # (12,)
-    nbr = sample["nbr_feat"][-1, node_idx]  # last step neighbour mean
+    x = sample["x_hist"][:, node_idx]
+    recent_steps = len(x)
     trend_summary = summarize_trend_context(
         sample,
         retrieved_samples,
         node_idx=node_idx,
     )
+    profile = _task_profile(domain_label=domain_label, static_context=static_context)
+    long_history_block = format_long_history_block(
+        sample,
+        node_idx=node_idx,
+        series_label=profile["series_label"],
+    )
+    long_history_prefix = f"{long_history_block}\n\n" if long_history_block else ""
 
-    # Retrieved history
-    retr_lines = []
-    for i, rs in enumerate(retrieved_samples):
-        rx = rs["x_hist"][:, node_idx]
-        retr_lines.append(f"  Ref {i+1}: {_format_series(rx)}")
-    retr_block = "\n".join(retr_lines) if retr_lines else "  (none)"
+    retr_block = format_retrieved_examples(
+        retrieved_samples,
+        node_idx=node_idx,
+        horizon=horizon,
+        include_future=True,
+    )
 
-    diff_str = format_diff_block(diff_features or {"diff_occ": 0.0, "diff_temp": None, "diff_price": None})
+    env_diff_block = ""
+    if include_env_diff:
+        diff_str = format_diff_block(diff_features)
+        env_diff_block = f"Environmental differentials: {diff_str}\n\n"
+    aux_block = format_auxiliary_feature_block(sample)
+    aux_prefix = f"{aux_block}\n\n" if aux_block else ""
+    neighbour_line = format_neighbour_context_line(
+        sample,
+        node_idx=node_idx,
+        series_label=profile["series_label"],
+    )
 
     # Add domain label as metadata prefix if provided
     meta_parts = []
-    if domain_label:
-        meta_parts.append(f"[Domain: {domain_label}]")
+    if profile["domain_label"]:
+        meta_parts.append(f"[Domain: {profile['domain_label']}]")
     static_block = format_static_context(static_context)
     if static_block:
         meta_parts.append(static_block)
@@ -104,39 +119,49 @@ def build_cot_prompt(
 
     user_msg = (
         f"{meta_prefix}"
-        f"Current historical occupancy (12 steps): {_format_series(x)}\n\n"
-        f"Retrieved similar windows:\n{retr_block}\n\n"
+        f"{long_history_prefix}"
+        f"Current historical {profile['series_label']} ({recent_steps} steps): {_format_series(x)}\n\n"
+        f"Retrieved similar examples:\n{retr_block}\n\n"
         f"Stage 1 trend cues:\n{format_trend_block(trend_summary, include_retrieved=bool(retrieved_samples))}\n\n"
-        f"Environmental differentials: {diff_str}\n\n"
-        f"Neighbour occupancy (last step): {nbr:.3f}\n\n"
+        f"{env_diff_block}"
+        f"{aux_prefix}"
+        f"{neighbour_line}"
         f"Forecast horizon: {horizon} steps\n\n"
+        f"You must output exactly {horizon} numeric values in the final list, one value for each future step. "
+        f"Do not output a shortened list or a single representative value.\n\n"
         f"{constant_forecast_instruction(include_retrieved=bool(retrieved_samples))}\n"
+        "For electricity price forecasting, preserve the day-ahead profile shape: low-price floor periods, ramps, "
+        "peak-price intervals, and later recovery should be predicted step by step rather than collapsed to the "
+        "minimum observed price.\n"
         "In Stage 1 compare both level and local trend cues. "
+        "Use the retrieved history-to-future examples as references, but adjust them according to the current trend, "
+        "known auxiliary features, environmental differentials, and neighbour context rather than copying them mechanically. "
         "In Stage 3 decide whether the forecast should keep changing or remain nearly flat based on those cues.\n"
         "Numerical Prediction:"
     )
-    return COT_SYSTEM_MSG, user_msg
+    return build_system_message(static_context=static_context, domain_label=profile["domain_label"], cot=True), user_msg
 
 
 def build_cot_target(
     sample: dict,
     retrieved_samples: list[dict],
-    diff_features: dict,
+    diff_features: dict | None,
     node_idx: int = 0,
     horizon: int = 6,
     static_context: dict | None = None,
+    include_env_diff: bool = False,
 ) -> str:
     """
     Build the supervised target string (for training).
     """
     x       = sample["x_hist"][:, node_idx]
-    nbr     = sample["nbr_feat"][-1, node_idx]
     y       = sample["y"][:horizon, node_idx]
     trend_summary = summarize_trend_context(
         sample,
         retrieved_samples,
         node_idx=node_idx,
     )
+    profile = _task_profile(static_context=static_context)
     diff_features = diff_features or {"diff_occ": 0.0, "diff_temp": None, "diff_price": None}
 
     curr_occ = float(x.mean())
@@ -144,7 +169,9 @@ def build_cot_target(
                if retrieved_samples else curr_occ
     diff_occ = diff_features.get("diff_occ", 0.0)
     gap_desc  = "higher demand" if diff_occ > 0.05 else ("lower demand" if diff_occ < -0.05 else "stable demand")
-    spatial_desc = "increasing pressure" if nbr > curr_occ + 0.05 else "stable neighbourhood"
+    has_neighbour_context = np.asarray(sample.get("x_hist")).ndim >= 2 and np.asarray(sample.get("x_hist")).shape[1] > 1
+    nbr = float(sample["nbr_feat"][-1, node_idx]) if has_neighbour_context else curr_occ
+    spatial_desc = "increasing pressure" if has_neighbour_context and nbr > curr_occ + 0.05 else "stable neighbourhood"
     if trend_summary["retrieved_trend_label"] is None:
         retr_trend = trend_summary["current_trend_label"]
         retr_last = trend_summary["current_last_value"]
@@ -170,8 +197,30 @@ def build_cot_target(
     if static_block:
         static_block = static_block.replace("Static station context:\n", "")
         static_block = static_block + "\n"
+    env_diff_line = ""
+    if include_env_diff:
+        env_diff_line = f"Environmental differentials: {format_diff_block(diff_features)}\n"
+
+    if horizon > 32:
+        y = sample["y"][:horizon, node_idx]
+        neighbour_target_line = (
+            f"Neighbour mean {profile['series_label']} (last step): {nbr:.3f}.\n"
+            if has_neighbour_context else
+            "No multi-node neighbour context is available for this target.\n"
+        )
+        return (
+            "## Stage 1 - Gap Analysis\n"
+            f"Current recent trend: {trend_summary['current_trend_label']}.\n"
+            f"Retrieved recent trend: {retr_trend}.\n"
+            f"{env_diff_line}"
+            "\n## Stage 2 - Spatial Logic\n"
+            f"{neighbour_target_line}"
+            "\n## Stage 3 - Numerical Prediction\n"
+            f"Numerical Prediction: {_format_series(y)}"
+        )
 
     return COT_TARGET_TEMPLATE.format(
+        series_label = profile["series_label"],
         curr_occ    = curr_occ,
         retr_occ    = retr_occ,
         curr_last   = trend_summary["current_last_value"],
@@ -181,7 +230,7 @@ def build_cot_target(
         retr_short  = retr_short,
         curr_trend  = trend_summary["current_trend_label"],
         retr_trend  = retr_trend,
-        diff_block  = format_diff_block(diff_features),
+        env_diff_line = env_diff_line,
         gap_desc    = gap_desc,
         trend_desc  = trend_desc,
         static_block= static_block,

@@ -34,15 +34,22 @@ LORA_CONFIG = dict(
 )
 
 
+def load_tokenizer(
+    model_path: str = MODEL_PATH,
+):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
 def load_model_and_tokenizer(
     model_path: str = MODEL_PATH,
     load_in_4bit: bool = False,
     device_map: str = "auto",
 ) -> tuple:
     """Load base model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = load_tokenizer(model_path)
 
     bnb_cfg = None
     if load_in_4bit:
@@ -56,7 +63,7 @@ def load_model_and_tokenizer(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         trust_remote_code=True,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         device_map=device_map,
         quantization_config=bnb_cfg,
     )

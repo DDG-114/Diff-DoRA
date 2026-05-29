@@ -1,0 +1,1 @@
+../projects/electricity_price_forecasting/scripts/run_moe_h96_smoke.sh

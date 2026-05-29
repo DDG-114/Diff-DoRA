@@ -14,7 +14,23 @@ import numpy as np
 SPLIT_RATIOS = {
     "st_evcdp": (0.6, 0.2, 0.2),
     "urbanev":  (0.8, 0.1, 0.1),
+    "wotai_evcdp": (0.6, 0.2, 0.2),
+    "renewable_solar": (0.6, 0.2, 0.2),
+    "renewable_wind": (0.6, 0.2, 0.2),
+    "gs_market": (1.0, 0.0, 0.0),
+    "gs_market_2025": (1.0, 0.0, 0.0),
+    "gs_price": (1.0, 0.0, 0.0),
+    "gs_price_2025": (1.0, 0.0, 0.0),
 }
+
+
+def _slice_optional_frame(frame, indices):
+    if frame is None or getattr(frame, "empty", True):
+        return frame
+    try:
+        return frame.iloc[indices]
+    except Exception:
+        return frame
 
 
 def build_splits(
@@ -44,6 +60,29 @@ def build_splits(
     occ = data["occupancy"]  # (T, N)
     ts  = data["timestamps"]
     T   = len(occ)
+
+    split_indices = data.get("split_indices")
+    if split_indices:
+        train_idx = np.asarray(split_indices.get("train", []), dtype=np.int64)
+        val_idx = np.asarray(split_indices.get("val", []), dtype=np.int64)
+        test_idx = np.asarray(split_indices.get("test", []), dtype=np.int64)
+        return {
+            "train": occ[train_idx],
+            "val": occ[val_idx],
+            "test": occ[test_idx],
+            "timestamps_train": ts[train_idx],
+            "timestamps_val": ts[val_idx],
+            "timestamps_test": ts[test_idx],
+            "norm_min": data.get("norm_min", 0.0),
+            "norm_max": data.get("norm_max", 1.0),
+            "node_ids": data.get("node_ids"),
+            "node_meta": data.get("node_meta"),
+            "adj": data.get("adj"),
+            "weather": data.get("weather"),
+            "price": data.get("price"),
+            "poi": data.get("poi"),
+            "missing_mask": data.get("missing_mask"),
+        }
 
     i1 = int(T * ratios[0])
     i2 = int(T * (ratios[0] + ratios[1]))

@@ -35,6 +35,10 @@ env/
 # Outputs / checkpoints
 /outputs/
 /checkpoints/
+/projects/*/outputs/
+/projects/*/checkpoints/
+/projects/*/data/
+/projects/*/references/
 
 # Documentation and Analysis
 SELF_CHECK_REPORT.md

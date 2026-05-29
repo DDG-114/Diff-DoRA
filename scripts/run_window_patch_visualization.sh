@@ -1,0 +1,1 @@
+../projects/electric_load_forecasting/scripts/run_window_patch_visualization.sh

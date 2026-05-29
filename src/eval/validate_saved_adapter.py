@@ -59,6 +59,8 @@ def main():
     parser.add_argument("--neighbor_k", type=int, default=7)
 
     parser.add_argument("--use_rag", action="store_true")
+    parser.add_argument("--use_diff_dora", action="store_true",
+                        help="Inject paper-style environmental differentials into retrieval prompts")
     parser.add_argument("--retrieval_cache", default="",
                         help="Path to retrieval cache pkl; default data/retrieval_cache/{dataset}_h{horizon}.pkl")
 
@@ -70,6 +72,9 @@ def main():
 
     parser.add_argument("--output", default="outputs/validate_saved_adapter_outputs.json")
     args = parser.parse_args()
+
+    if args.use_diff_dora and not args.use_rag:
+        raise ValueError("--use_diff_dora requires --use_rag")
 
     raw = _load_dataset(args.dataset)
     splits = build_splits(raw, args.dataset)
@@ -119,6 +124,12 @@ def main():
     print("Loading model …")
     base_model, tokenizer = load_model_and_tokenizer()
     model = load_peft_model(base_model, args.adapter_dir)
+    ctrl_path = Path(args.adapter_dir).parent / "diff_controller.pt"
+    if ctrl_path.exists():
+        print(
+            f"[WARN] Ignoring legacy Diff-DoRA controller checkpoint: {ctrl_path} "
+            "(paper-style Diff-DoRA is prompt-only now)."
+        )
     model.eval()
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
@@ -153,6 +164,7 @@ def main():
                 args.horizon,
                 domain_label=domain_label,
                 static_context=static_context,
+                include_env_diff=args.use_diff_dora,
             )
             retrieved_t_starts = [int(s.get("t_start", -1)) for s in retrieved]
         else:
@@ -206,6 +218,8 @@ def main():
         "node_idx": args.node_idx,
         "adapter_dir": args.adapter_dir,
         "use_rag": args.use_rag,
+        "use_diff_dora": args.use_diff_dora,
+        "diff_dora_impl": "prompt_only" if args.use_diff_dora else None,
         "history_len": args.history_len,
         "neighbor_k": args.neighbor_k,
         "max_eval": args.max_eval,

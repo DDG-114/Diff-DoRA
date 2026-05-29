@@ -28,11 +28,12 @@ from pathlib import Path
 
 import numpy as np
 
-from src.data.load_st_evcdp import load_st_evcdp
-from src.data.load_urbanev import load_urbanev
 from src.data.build_splits import build_splits
 from src.data.build_samples import build_samples
-from src.utils.node_context import extract_node_static_context
+from src.data.loaders import DATASET_CHOICES, load_dataset
+from src.data.windowing import default_retrieval_cache_path, resolve_window_stride
+from src.utils.history_window import price_at_history_end, weather_at_history_end
+from src.utils.node_context import extract_node_static_context, resolve_node_id
 from src.eval.metrics import per_horizon_metrics
 from src.models.qwen_peft import load_model_and_tokenizer, load_peft_model, generate_batch
 from src.prompts.prompt_cot import build_cot_prompt
@@ -44,20 +45,63 @@ from src.routing.build_labels import build_routing_labels
 from src.routing.hard_router import HardRouter
 
 
-def _load_dataset(dataset: str) -> dict:
-    return load_st_evcdp() if dataset == "st_evcdp" else load_urbanev()
+def _weather_at(weather, sample: dict) -> dict | None:
+    return weather_at_history_end(weather, sample)
+
+
+def _price_at(price, sample: dict, node_idx: int, *, node_ids=None, node_meta=None) -> float | None:
+    return price_at_history_end(price, sample, node_idx, node_ids=node_ids, node_meta=node_meta)
+
+
+def _compute_retrieval_diff(sample: dict, retrieved: list[dict], splits: dict, node_idx: int) -> dict:
+    weather_current = _weather_at(splits.get("weather"), sample)
+    weather_retrieved = [_weather_at(splits.get("weather"), rs) for rs in retrieved]
+    price_current = _price_at(
+        splits.get("price"),
+        sample,
+        node_idx,
+        node_ids=splits.get("node_ids"),
+        node_meta=splits.get("node_meta"),
+    )
+    price_retrieved = [
+        _price_at(
+            splits.get("price"),
+            rs,
+            node_idx,
+            node_ids=splits.get("node_ids"),
+            node_meta=splits.get("node_meta"),
+        )
+        for rs in retrieved
+    ]
+    return compute_diff_features(
+        query_sample=sample,
+        retrieved_samples=retrieved,
+        weather_current=weather_current,
+        weather_retrieved=weather_retrieved,
+        price_current=price_current,
+        price_retrieved=price_retrieved,
+        node_idx=node_idx,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="urbanev", choices=["st_evcdp", "urbanev"])
+    parser.add_argument("--dataset", default="urbanev", choices=DATASET_CHOICES)
     parser.add_argument("--horizon", type=int, required=True)
     parser.add_argument("--split", default="test", choices=["val", "test"])
     parser.add_argument("--expert_0_dir", required=True, help="Path to expert_0 adapter (CBD)")
     parser.add_argument("--expert_1_dir", required=True, help="Path to expert_1 adapter (Residential)")
     parser.add_argument("--history_len", type=int, default=12)
     parser.add_argument("--neighbor_k", type=int, default=7)
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=0,
+        help="Window step size. `0` means use `horizon`; `1` keeps overlapping sliding windows.",
+    )
     parser.add_argument("--use_rag", action="store_true")
+    parser.add_argument("--use_diff_dora", action="store_true",
+                        help="Inject paper-style environmental differentials into retrieval prompts")
     parser.add_argument("--retrieval_cache", default="",
                         help="Path to retrieval cache pkl; default data/retrieval_cache/{dataset}_h{horizon}.pkl")
     parser.add_argument("--max_eval", type=int, default=100)
@@ -73,7 +117,11 @@ def main():
     parser.add_argument("--output", default="outputs/eval_moe_routed.json")
     args = parser.parse_args()
 
-    raw = _load_dataset(args.dataset)
+    if args.use_diff_dora and not args.use_rag:
+        raise ValueError("--use_diff_dora requires --use_rag")
+
+    args.window_stride = resolve_window_stride(args.window_stride, horizon=args.horizon)
+    raw = load_dataset(args.dataset)
     splits = build_splits(raw, args.dataset)
 
     # Build router based on training data physical attributes
@@ -90,6 +138,7 @@ def main():
         horizons=[args.horizon],
         history_len=args.history_len,
         neighbor_k=args.neighbor_k,
+        window_stride=args.window_stride,
     )
     all_samples = sample_map[args.horizon]
 
@@ -107,7 +156,7 @@ def main():
         if args.retrieval_cache:
             cache_path = Path(args.retrieval_cache)
         else:
-            cache_path = Path(f"data/retrieval_cache/{args.dataset}_h{args.horizon}.pkl")
+            cache_path = default_retrieval_cache_path(args.dataset, args.horizon, args.window_stride)
         if cache_path.exists():
             retriever = KNNRetriever.load(cache_path)
             print(f"Loaded retrieval cache: {cache_path}")
@@ -119,6 +168,7 @@ def main():
                 horizons=[args.horizon],
                 history_len=args.history_len,
                 neighbor_k=args.neighbor_k,
+                window_stride=args.window_stride,
             )
             train_pool = train_sample_map[args.horizon]
             print(
@@ -130,6 +180,12 @@ def main():
     print("Loading base model and experts …")
     base_model, tokenizer = load_model_and_tokenizer()
     expert_0 = load_peft_model(base_model, args.expert_0_dir)
+    ctrl_path_0 = Path(args.expert_0_dir).parent / "diff_controller.pt"
+    if ctrl_path_0.exists():
+        print(
+            f"[WARN] Ignoring legacy Diff-DoRA controller checkpoint: {ctrl_path_0} "
+            "(paper-style Diff-DoRA is prompt-only now)."
+        )
     expert_0.eval()
     if hasattr(expert_0, "gradient_checkpointing_disable"):
         expert_0.gradient_checkpointing_disable()
@@ -146,6 +202,12 @@ def main():
 
     base_model, _ = load_model_and_tokenizer()
     expert_1 = load_peft_model(base_model, args.expert_1_dir)
+    ctrl_path_1 = Path(args.expert_1_dir).parent / "diff_controller.pt"
+    if ctrl_path_1.exists():
+        print(
+            f"[WARN] Ignoring legacy Diff-DoRA controller checkpoint: {ctrl_path_1} "
+            "(paper-style Diff-DoRA is prompt-only now)."
+        )
     expert_1.eval()
     if hasattr(expert_1, "gradient_checkpointing_disable"):
         expert_1.gradient_checkpointing_disable()
@@ -191,11 +253,7 @@ def main():
 
             # Build prompt with physical attribute metadata
             if args.use_rag and retriever is not None:
-                diff = compute_diff_features(
-                    query_sample=sample,
-                    retrieved_samples=retrieved,
-                    node_idx=sample_node_idx,
-                )
+                diff = _compute_retrieval_diff(sample, retrieved, splits, sample_node_idx)
                 sys_msg, usr_msg = build_cot_prompt(
                     sample,
                     retrieved,
@@ -204,6 +262,7 @@ def main():
                     args.horizon,
                     domain_label=expert_domain,
                     static_context=static_context,
+                    include_env_diff=args.use_diff_dora,
                 )
             else:
                 sys_msg, usr_msg = build_vanilla_prompt(
@@ -280,8 +339,11 @@ def main():
         "expert_0_dir": args.expert_0_dir,
         "expert_1_dir": args.expert_1_dir,
         "use_rag": args.use_rag,
+        "use_diff_dora": args.use_diff_dora,
+        "diff_dora_impl": "prompt_only" if args.use_diff_dora else None,
         "history_len": args.history_len,
         "neighbor_k": args.neighbor_k,
+        "window_stride": args.window_stride,
         "max_eval": args.max_eval,
         "max_nodes": args.max_nodes,
         "infer_batch_size": args.infer_batch_size,

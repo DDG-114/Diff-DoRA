@@ -1,0 +1,1 @@
+../projects/electricity_price_forecasting/scripts/run_single_h96_2week.sh

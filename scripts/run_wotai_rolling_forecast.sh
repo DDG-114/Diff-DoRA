@@ -1,0 +1,1 @@
+../projects/electric_load_forecasting/scripts/run_wotai_rolling_forecast.sh

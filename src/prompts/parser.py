@@ -26,9 +26,7 @@ def _coerce_expected_len(arr: np.ndarray, expected_len: int | None) -> np.ndarra
         return arr
     if len(arr) > expected_len:
         return arr[:expected_len]
-    if len(arr) == 0:
-        return np.zeros(expected_len, dtype=np.float32)
-    return np.pad(arr, (0, expected_len - len(arr)), constant_values=arr[-1])
+    return None
 
 
 def _iter_json_candidates(text: str):

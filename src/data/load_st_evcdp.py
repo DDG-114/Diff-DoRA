@@ -24,6 +24,16 @@ import pandas as pd
 
 RAW_DIR = Path("data/raw/st_evcdp")
 PROCESSED_PATH = Path("data/processed/st_evcdp.pkl")
+TRAINNORM_H6_PROCESSED_PATH = Path("data/processed/st_evcdp_trainnorm_h6.pkl")
+TRAIN_SPLIT_RATIO = 0.6
+FULL_DATA_NORMALIZATION = "full_data"
+TRAIN_ONLY_NORMALIZATION = "train_only"
+
+EXPECTED_OCCUPANCY_SHAPE = (8640, 247)
+EXPECTED_ADJ_SHAPE = (247, 247)
+EXPECTED_WEATHER_SHAPE = (8640, 5)
+EXPECTED_PRICE_SHAPE = (8640, 247)
+REQUIRED_NODE_META_FIELDS = ("zone_type", "capacity", "area")
 
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -253,10 +263,105 @@ def normalize(arr: np.ndarray) -> tuple[np.ndarray, float, float]:
     return (arr - vmin) / (vmax - vmin + eps), vmin, vmax
 
 
+def _resolve_processed_path(
+    processed_path: Path | None,
+    normalization_source: str,
+) -> Path:
+    if processed_path is not None:
+        return Path(processed_path)
+    if normalization_source == TRAIN_ONLY_NORMALIZATION:
+        return TRAINNORM_H6_PROCESSED_PATH
+    return PROCESSED_PATH
+
+
+def _normalise_occupancy(
+    occ_raw: np.ndarray,
+    *,
+    normalization_source: str,
+) -> tuple[np.ndarray, float, float]:
+    if normalization_source == FULL_DATA_NORMALIZATION:
+        return normalize(occ_raw)
+    if normalization_source == TRAIN_ONLY_NORMALIZATION:
+        train_end = int(len(occ_raw) * TRAIN_SPLIT_RATIO)
+        occ_train = occ_raw[:train_end]
+        vmin = float(occ_train.min())
+        vmax = float(occ_train.max())
+        eps = 1e-8
+        occ_norm = (occ_raw - vmin) / (vmax - vmin + eps)
+        return occ_norm.astype(np.float32), vmin, vmax
+    raise ValueError(
+        f"Unsupported normalization_source={normalization_source!r}; "
+        f"expected one of {{{FULL_DATA_NORMALIZATION!r}, {TRAIN_ONLY_NORMALIZATION!r}}}."
+    )
+
+
+def validate_st_evcdp_processed(
+    data: dict,
+    *,
+    strict: bool = True,
+) -> dict:
+    occupancy = data.get("occupancy")
+    adj = data.get("adj")
+    weather = data.get("weather")
+    price = data.get("price")
+    node_meta = data.get("node_meta")
+
+    errors = []
+    if occupancy is None or tuple(getattr(occupancy, "shape", ())) != EXPECTED_OCCUPANCY_SHAPE:
+        errors.append(
+            f"occupancy shape={getattr(occupancy, 'shape', None)!r} "
+            f"(expected {EXPECTED_OCCUPANCY_SHAPE!r})"
+        )
+    if adj is None or tuple(getattr(adj, "shape", ())) != EXPECTED_ADJ_SHAPE:
+        errors.append(f"adj shape={getattr(adj, 'shape', None)!r} (expected {EXPECTED_ADJ_SHAPE!r})")
+    if weather is None or tuple(getattr(weather, "shape", ())) != EXPECTED_WEATHER_SHAPE:
+        errors.append(
+            f"weather shape={getattr(weather, 'shape', None)!r} "
+            f"(expected {EXPECTED_WEATHER_SHAPE!r})"
+        )
+    if price is None or tuple(getattr(price, "shape", ())) != EXPECTED_PRICE_SHAPE:
+        errors.append(
+            f"price shape={getattr(price, 'shape', None)!r} "
+            f"(expected {EXPECTED_PRICE_SHAPE!r})"
+        )
+    if node_meta is None or getattr(node_meta, "empty", True):
+        errors.append("node_meta is missing or empty")
+    else:
+        missing_fields = [field for field in REQUIRED_NODE_META_FIELDS if field not in node_meta.columns]
+        if missing_fields:
+            errors.append(f"node_meta missing required fields: {missing_fields}")
+
+    numeric_checks = [
+        ("occupancy", occupancy),
+        ("adj", adj),
+    ]
+    if weather is not None and not getattr(weather, "empty", True):
+        numeric_checks.append(("weather", weather.to_numpy(dtype=np.float32)))
+    if price is not None and not getattr(price, "empty", True):
+        numeric_checks.append(("price", price.to_numpy(dtype=np.float32)))
+    for name, arr in numeric_checks:
+        if arr is None:
+            continue
+        if np.isnan(np.asarray(arr, dtype=np.float32)).any():
+            errors.append(f"{name} contains NaN values")
+
+    if errors and strict:
+        raise ValueError("ST-EVCDP validation failed: " + "; ".join(errors))
+    return {
+        "occupancy_shape": getattr(occupancy, "shape", None),
+        "adj_shape": getattr(adj, "shape", None),
+        "weather_shape": getattr(weather, "shape", None),
+        "price_shape": getattr(price, "shape", None),
+        "node_meta_columns": [] if node_meta is None else list(node_meta.columns),
+        "errors": errors,
+    }
+
+
 def load_st_evcdp(
     raw_dir: Path = RAW_DIR,
-    processed_path: Path = PROCESSED_PATH,
+    processed_path: Path | None = None,
     force_reprocess: bool = False,
+    normalization_source: str = FULL_DATA_NORMALIZATION,
 ) -> dict:
     """
     Load ST-EVCDP dataset.
@@ -272,9 +377,13 @@ def load_st_evcdp(
         "norm_max":   float,
     }
     """
+    processed_path = _resolve_processed_path(processed_path, normalization_source)
     if processed_path.exists() and not force_reprocess:
         with open(processed_path, "rb") as f:
-            return _ensure_cached_node_ids(pickle.load(f), raw_dir)
+            cached = _ensure_cached_node_ids(pickle.load(f), raw_dir)
+        cached_source = cached.get("normalization_source", FULL_DATA_NORMALIZATION)
+        if cached_source == normalization_source:
+            return cached
 
     df = load_occupancy(raw_dir)
     node_ids = [str(col) for col in df.columns]
@@ -290,7 +399,10 @@ def load_st_evcdp(
     occ_df = occ_df.ffill().bfill()
     occ_raw = occ_df.values.astype(np.float32)
 
-    occ_norm, vmin, vmax = normalize(occ_raw)
+    occ_norm, vmin, vmax = _normalise_occupancy(
+        occ_raw,
+        normalization_source=normalization_source,
+    )
 
     adj = load_adjacency(raw_dir, n_nodes=N, node_ids=node_ids)
 
@@ -305,6 +417,7 @@ def load_st_evcdp(
         "weather": weather,
         "norm_min": vmin,
         "norm_max": vmax,
+        "normalization_source": normalization_source,
     }
 
     processed_path.parent.mkdir(parents=True, exist_ok=True)

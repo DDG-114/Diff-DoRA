@@ -19,15 +19,12 @@ import json
 import time
 from pathlib import Path
 
-import torch
-
 from src.data.load_st_evcdp import load_st_evcdp
 from src.data.load_urbanev import load_urbanev
 from src.data.build_splits import build_splits
 from src.data.build_samples import build_samples
 from src.utils.node_context import extract_node_static_context
 from src.models.qwen_peft import load_model_and_tokenizer, load_peft_model, generate
-from src.models.diff_dora import DiffDoRAModel, set_diff_context
 from src.prompts.prompt_cot import build_cot_prompt
 from src.prompts.prompt_vanilla import build_vanilla_prompt
 from src.prompts.parser import parse_output
@@ -49,20 +46,14 @@ def pick_test_nodes(router: HardRouter, n_cbd: int = 2, n_res: int = 3) -> list[
     return chosen
 
 
-def load_expert(base_model, adapter_dir: str, use_diff_dora: bool,
-                diff_hidden_dim: int, diff_scale: float, device):
+def load_expert(base_model, adapter_dir: str):
     model = load_peft_model(base_model, adapter_dir)
-    if use_diff_dora:
-        wrapper = DiffDoRAModel(model, diff_input_dim=3,
-                                hidden_dim=diff_hidden_dim, scale=diff_scale)
-        wrapper.to(device)
-        ctrl_path = Path(adapter_dir).parent / "diff_controller.pt"
-        if ctrl_path.exists():
-            wrapper.controller.load_state_dict(
-                torch.load(ctrl_path, map_location="cpu"))
-            wrapper.controller.to(device)
-        wrapper.eval()
-        return wrapper
+    ctrl_path = Path(adapter_dir).parent / "diff_controller.pt"
+    if ctrl_path.exists():
+        print(
+            f"[WARN] Ignoring legacy Diff-DoRA controller checkpoint: {ctrl_path} "
+            "(paper-style Diff-DoRA is prompt-only now)."
+        )
     model.eval()
     return model
 
@@ -79,9 +70,8 @@ def main():
     parser.add_argument("--expert_1_dir", required=True,
                         help="Residential expert adapter path")
     parser.add_argument("--use_rag",      action="store_true")
-    parser.add_argument("--use_diff_dora",action="store_true")
-    parser.add_argument("--diff_hidden_dim", type=int, default=32)
-    parser.add_argument("--diff_scale",   type=float, default=0.5)
+    parser.add_argument("--use_diff_dora",action="store_true",
+                        help="Inject paper-style environmental differentials into retrieval prompts")
     parser.add_argument("--max_new_tokens", type=int, default=256,
                         help="Max tokens for generation; CoT reasoning needs ~200+")
     parser.add_argument("--retrieval_cache", default="",
@@ -90,6 +80,9 @@ def main():
                         help="Save system and user prompts in output JSON (default: True)")
     parser.add_argument("--output",       default="outputs/quick_nodes_eval.json")
     args = parser.parse_args()
+
+    if args.use_diff_dora and not args.use_rag:
+        raise ValueError("--use_diff_dora requires --use_rag in eval_quick_nodes")
 
     # ── 1. 数据 ─────────────────────────────────────────────────────────────
     raw    = load_st_evcdp() if args.dataset == "st_evcdp" else load_urbanev()
@@ -125,14 +118,23 @@ def main():
             retriever = KNNRetriever.load(cache_path)
             print(f"Loaded retrieval cache: {cache_path}")
         else:
-            print(f"[WARN] No retrieval cache at {cache_path}; running without RAG.")
+            train_map = build_samples(
+                splits["train"],
+                splits["timestamps_train"],
+                adj=splits.get("adj"),
+                horizons=[args.horizon],
+            )
+            train_pool = train_map[args.horizon]
+            print(
+                f"[WARN] No retrieval cache at {cache_path}; building in-memory retriever "
+                f"from train pool: {len(train_pool)}"
+            )
+            retriever = KNNRetriever(train_pool, top_k=2)
 
     # ── 4. 加载两个专家 ──────────────────────────────────────────────────────
     print("\nLoading base model …")
     base0, tokenizer = load_model_and_tokenizer()
-    device = next(base0.parameters()).device
-    expert_0 = load_expert(base0, args.expert_0_dir, args.use_diff_dora,
-                           args.diff_hidden_dim, args.diff_scale, device)
+    expert_0 = load_expert(base0, args.expert_0_dir)
 
     import gc, torch as _torch
     del base0
@@ -141,8 +143,7 @@ def main():
     gc.collect()
 
     base1, _ = load_model_and_tokenizer()
-    expert_1 = load_expert(base1, args.expert_1_dir, args.use_diff_dora,
-                           args.diff_hidden_dim, args.diff_scale, device)
+    expert_1 = load_expert(base1, args.expert_1_dir)
 
     experts = {0: expert_0, 1: expert_1}
     domain_names = {0: "CBD", 1: "Residential"}
@@ -175,19 +176,12 @@ def main():
                     retrieved_samples=retrieved,
                     node_idx=node_idx,
                 )
-                if args.use_diff_dora:
-                    set_diff_context(torch.tensor([
-                        float(diff.get("diff_occ", 0.0) or 0.0),
-                        float(diff.get("diff_temp", 0.0) or 0.0),
-                        float(diff.get("diff_price", 0.0) or 0.0),
-                    ], dtype=torch.float32))
                 sys_msg, usr_msg = build_cot_prompt(
                     sample, retrieved, diff, node_idx, args.horizon,
                     domain_label=domain,
-                    static_context=static_context)
+                    static_context=static_context,
+                    include_env_diff=args.use_diff_dora)
             else:
-                if args.use_diff_dora:
-                    set_diff_context(torch.zeros(3, dtype=torch.float32))
                 sys_msg, usr_msg = build_vanilla_prompt(
                     sample, node_idx, args.horizon,
                     domain_label=domain,
@@ -242,6 +236,7 @@ def main():
         "test_nodes":   test_nodes,
         "use_rag":      args.use_rag,
         "use_diff_dora":args.use_diff_dora,
+        "diff_dora_impl": "prompt_only" if args.use_diff_dora else None,
         "n_samples":    N_SAMPLES,
         "parse_success": n_ok / max(total, 1),
         "by_domain":    by_dom,

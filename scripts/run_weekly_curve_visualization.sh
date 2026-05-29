@@ -1,0 +1,1 @@
+../projects/electric_load_forecasting/scripts/run_weekly_curve_visualization.sh

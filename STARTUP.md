@@ -111,6 +111,25 @@ python -m src.train.train_urbanev \
 
 ### 5.3 双专家 MoE / Diff-DoRA
 
+当前仓库保留两条运行路径：
+
+- `legacy baseline`：当前默认 quick 路径，保留为可回退工程基线
+- `strict repro`：新增加的严格复现路径，用于全量专家训练和完整测试集评测
+
+`legacy baseline` 的典型特征：
+
+- `max_samples_per_expert=1000`
+- 有 cache 时 expert-local retrieval bank 默认截断到 `800`
+- quick ablation 常用 `max_eval=6`
+
+这些设置适合快速比较，不应直接作为最终论文表格协议。
+
+这里的 `--use_diff_dora` 现在表示：
+
+- 保持 `DoRA` 作为唯一模型侧适配器
+- 仅在 `RAG` 结构化 prompt 中注入环境差分（温度 / 电价）
+- 不再使用数值 side-channel、controller MLP 或 `diff_controller.pt`
+
 ```bash
 source .venv/bin/activate
 python -m src.train.train_experts \
@@ -121,6 +140,48 @@ python -m src.train.train_experts \
   --use_diff_dora \
   --use_rag
 ```
+
+如果你要保留当前 quick 协议并一键跑 `full/wo_diffdora`：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_train_eval_diffdora.sh st_evcdp 6
+```
+
+如果你要跑严格复现候选版本：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_train_eval_diffdora_strict.sh st_evcdp 6
+```
+
+当前这条 strict 入口默认就是：
+
+- `batch_size=16`
+- `max_samples_per_expert=0`，即完整训练集
+- `retrieval_bank_max_samples_per_expert=0`，即完整 retrieval bank
+
+如果你想手动覆盖，参数顺序是：
+
+```bash
+bash scripts/run_train_eval_diffdora_strict.sh <dataset> <horizon> <batch_size> <sample_cap> <retrieval_bank_cap>
+```
+
+如果你要只做 `full` / `wo_diffdora` 的全量训练，不自动进入评测，并且用两张 GPU 并行跑：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_train_full_repro_parallel.sh st_evcdp 6 16
+```
+
+这条入口固定为：
+
+- `full` 放在 GPU 0
+- `wo_diffdora` 放在 GPU 1
+- `batch_size=16`
+- `max_samples_per_expert=0`
+- `retrieval_bank_max_samples_per_expert=0`
+- `eval_steps=0`
 
 ## 6. 常用评测命令
 
@@ -145,7 +206,8 @@ python -m src.eval.eval_moe_routed \
   --horizon 6 \
   --expert_0_dir outputs/st_evcdp_moe_diffdora_h6/expert_0/adapter \
   --expert_1_dir outputs/st_evcdp_moe_diffdora_h6/expert_1/adapter \
-  --use_rag
+  --use_rag \
+  --use_diff_dora
 ```
 
 ### 6.3 Quick Nodes 冒烟测试
@@ -166,6 +228,109 @@ python -m src.eval.eval_quick_nodes \
 ```bash
 source .venv/bin/activate
 bash scripts/run_ablation_paper.sh st_evcdp 6
+```
+
+### 6.5 Strict 全测试集评测
+
+在 `strict` 训练完成后，可单独跑完整测试集 + 全节点评测：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_eval_diffdora_strict.sh st_evcdp 6
+```
+
+### 6.6 Few-shot 少样本预测
+
+Few-shot 现在按“训练时间前缀比例”运行：
+
+- 测试集保持不变
+- 训练只取 train split 最前面的一部分时间窗口
+- 站点集合保持不变
+- 默认训练样本上限为 `4000`
+
+快捷入口：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_fewshot.sh st_evcdp 6
+```
+
+如果你想先单独把 strict few-shot / zero-shot 预处理产物准备好，再启动实验：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_preprocess_shots.sh st_evcdp 6 all
+```
+
+只预处理 few-shot：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_preprocess_shots.sh st_evcdp 6 fewshot
+```
+
+只预处理 zero-shot：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_preprocess_shots.sh st_evcdp 6 zeroshot
+```
+
+这条预处理入口会提前构建：
+
+- `data/processed/st_evcdp_trainnorm_h6.pkl`
+- `data/manifests/st_evcdp/fewshot_st_evcdp_h6_step6_seed42.json`
+- `data/manifests/st_evcdp/zeroshot_st_evcdp_h6_step6_seed42.json`
+- `data/retrieval_cache/shot/*.pkl`（few-shot）
+- `data/sample_cache/shot/*.pkl`（zero-shot 的 masked train windows）
+
+如果你要自定义比例、节点数或评测规模：
+
+```bash
+source .venv/bin/activate
+python -m src.eval.eval_fewshot \
+  --dataset st_evcdp \
+  --horizon 6 \
+  --fewshot_ratios 0.05,0.10,0.20 \
+  --max_train_items 4000 \
+  --use_dora \
+  --use_diff_dora \
+  --use_rag \
+  --prompt_style cot
+```
+
+### 6.7 Zero-shot 零样本预测
+
+Zero-shot 现在统一按“hard-routing MoE 训练 + target 节点零样本评测”运行：
+
+- source 节点先按 `CBD / Residential` 路由到两个 expert
+- 训练阶段只用 source 节点训练对应 expert
+- train split 会对 target 节点负荷与邻接影响做屏蔽，避免训练泄漏
+- 测试阶段仅在 target 节点上计算指标，并按同一路由规则激活 expert
+- strict 版本默认使用 `train_only` 归一化、`window_stride=6`、`source_masked` retrieval query view
+- 默认总训练样本上限为 `4000`
+
+快捷入口：
+
+```bash
+source .venv/bin/activate
+bash scripts/run_zeroshot.sh st_evcdp 6
+```
+
+如果你要自定义 source 比例、target 节点数或评测规模：
+
+```bash
+source .venv/bin/activate
+python -m src.eval.eval_zeroshot \
+  --strict_protocol \
+  --dataset st_evcdp \
+  --horizon 6 \
+  --source_ratios 0.20,0.40,0.60,0.80 \
+  --max_train_items 4000 \
+  --use_dora \
+  --use_diff_dora \
+  --use_rag \
+  --prompt_style cot
 ```
 
 ## 7. 论文默认超参
@@ -222,14 +387,15 @@ python -m src.eval.validate_saved_adapter \
 
 ## 11. 修复版 Expert Ablation 复现命令
 
-下面这条命令用于重新验证并修复 `wo_dora > full` 的偏差问题。
+下面这条命令用于跑当前论文对齐版的 expert ablation。
 
 特点：
 
-- 使用修复后的 `DiffDoRA` batch 条件化
+- `Diff-DoRA` 采用 prompt-only 环境差分注入
 - 所有变体统一导出 best snapshot
-- 使用新的输出目录，保留旧结果作为对照
+- 旧的 controller 版输出仅保留作历史对照，不应与当前结果直接混用
 - 评测协议固定为 `max_eval=60`、`12 CBD + 12 Residential`、`max_new_tokens=512`、`infer_batch_size=12`
+- 这一节描述的仍是当前 quick/legacy 协议，不等于 strict full-test 复现协议
 
 ```bash
 cd /root/Diff-DoRA
@@ -264,3 +430,11 @@ cd /root/Diff-DoRA
 source .venv/bin/activate
 bash scripts/run_ablation_expert_only.sh st_evcdp 6
 ```
+
+## 12. 审计与双轨说明
+
+- 当前 quick 路径的差异审计见 `repro_audit.md`
+- `legacy baseline` 继续保留脚本和结果，便于回退和快速比对
+- `strict repro` 入口单独放在：
+  - `scripts/run_train_eval_diffdora_strict.sh`
+  - `scripts/run_eval_diffdora_strict.sh`

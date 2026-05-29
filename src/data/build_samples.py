@@ -1,15 +1,22 @@
 """
 src/data/build_samples.py
 --------------------------
-Sliding-window sample builder.
+Window sample builder with configurable stride and optional long-history context.
 
-Each sample:
-  x_hist  : (12, N)         – normalised historical occupancy
-  time_feat: (12, 4)        – [hour_sin, hour_cos, dow_sin, dow_cos]
-  nbr_feat : (12, N)        – mean of each node's direct neighbours
-  y        : (horizon, N)   – target occupancy
+Each sample always includes a recent history slice:
+    x_hist    : (history_len, N)        – normalised recent history
+    time_feat : (history_len, 4)        – [hour_sin, hour_cos, dow_sin, dow_cos]
+    nbr_feat  : (history_len, N)        – mean of each node's direct neighbours
+    y         : (horizon, N)            – target occupancy
 
-Supports horizons 3, 6, 9, 12.
+When ``context_history_len`` is larger than ``history_len``, the sample also
+includes a long-range context slice:
+    x_context         : (context_history_len, N)
+    time_feat_context : (context_history_len, 4)
+    nbr_feat_context  : (context_history_len, N)
+
+Supports horizons 3, 6, 9, 12 by default, while allowing arbitrary positive
+horizon values when passed explicitly.
 """
 from __future__ import annotations
 
@@ -18,6 +25,22 @@ from typing import Sequence
 
 HISTORY_LEN = 12
 VALID_HORIZONS = (3, 6, 9, 12)
+
+
+def _resolve_context_history_len(history_len: int, context_history_len: int | None) -> int:
+    history_len = int(history_len)
+    if history_len <= 0:
+        raise ValueError(f"history_len must be positive, got {history_len}")
+    if context_history_len is None or int(context_history_len) <= 0:
+        return history_len
+
+    resolved = int(context_history_len)
+    if resolved < history_len:
+        raise ValueError(
+            f"context_history_len must be >= history_len, got context_history_len={resolved}, "
+            f"history_len={history_len}"
+        )
+    return resolved
 
 
 def _time_features(timestamps) -> np.ndarray:
@@ -65,18 +88,28 @@ def build_samples(
     occ: np.ndarray,
     timestamps,
     adj: np.ndarray | None = None,
+    aux_features=None,
     horizons: Sequence[int] = VALID_HORIZONS,
     history_len: int = HISTORY_LEN,
+    context_history_len: int | None = None,
     neighbor_k: int | None = None,
+    window_stride: int = 1,
 ) -> dict[int, list[dict]]:
     """
-    Build sliding-window samples for each horizon.
+    Build window samples for each horizon.
 
     Returns
     -------
     { horizon: [ {"x_hist", "time_feat", "nbr_feat", "y", "t_start"}, ... ] }
     """
     T, N = occ.shape
+    history_len = int(history_len)
+    if history_len <= 0:
+        raise ValueError(f"history_len must be positive, got {history_len}")
+    effective_context_history_len = _resolve_context_history_len(history_len, context_history_len)
+    window_stride = int(window_stride)
+    if window_stride <= 0:
+        raise ValueError(f"window_stride must be positive, got {window_stride}")
 
     # Pre-compute features for entire sequence
     if timestamps is not None and hasattr(timestamps, "hour"):
@@ -84,30 +117,71 @@ def build_samples(
     else:
         time_feats = np.zeros((T, 4), dtype=np.float32)
 
+    aux_values = None
+    aux_columns = None
+    if aux_features is not None and not getattr(aux_features, "empty", True):
+        if hasattr(aux_features, "reindex") and timestamps is not None:
+            aux_frame = aux_features.reindex(timestamps).interpolate(method="time", limit_direction="both").ffill().bfill()
+        else:
+            aux_frame = aux_features
+        if hasattr(aux_frame, "columns"):
+            aux_columns = [str(col) for col in aux_frame.columns]
+        aux_values = np.asarray(aux_frame, dtype=np.float32)
+        if aux_values.shape[0] != T:
+            raise ValueError(f"aux_features length mismatch: got {aux_values.shape[0]}, expected {T}")
+
     nbr_feats = _neighbour_features(occ, adj, neighbor_k=neighbor_k)  # (T, N)
 
     max_horizon = max(horizons)
     samples: dict[int, list] = {h: [] for h in horizons}
 
-    for t in range(history_len, T - max_horizon + 1):
-        x_hist   = occ[t - history_len : t]               # (12, N)
-        t_feat   = time_feats[t - history_len : t]        # (12, 4)
-        n_feat   = nbr_feats[t - history_len : t]         # (12, N)
+    for t in range(effective_context_history_len, T - max_horizon + 1, window_stride):
+        x_hist = occ[t - history_len : t]
+        t_feat = time_feats[t - history_len : t]
+        n_feat = nbr_feats[t - history_len : t]
+
+        x_context = None
+        t_context = None
+        n_context = None
+        if effective_context_history_len > history_len:
+            x_context = occ[t - effective_context_history_len : t]
+            t_context = time_feats[t - effective_context_history_len : t]
+            n_context = nbr_feats[t - effective_context_history_len : t]
 
         for h in horizons:
             if t + h > T:
                 continue
             y = occ[t : t + h]                            # (h, N)
-            samples[h].append({
+            sample = {
                 "x_hist":    x_hist,
                 "time_feat": t_feat,
                 "nbr_feat":  n_feat,
                 "y":         y,
                 "t_start":   t,
-            })
+                "history_len": history_len,
+                "context_history_len": effective_context_history_len,
+                "history_end_idx": t - 1,
+            }
+            if timestamps is not None and hasattr(timestamps, "__len__"):
+                sample["history_end_timestamp"] = timestamps[t - 1]
+                sample["target_start_timestamp"] = timestamps[t]
+            if aux_values is not None:
+                sample["aux_hist"] = aux_values[t - history_len : t]
+                sample["aux_future"] = aux_values[t : t + h]
+                sample["aux_columns"] = aux_columns
+            if x_context is not None and t_context is not None and n_context is not None:
+                sample["x_context"] = x_context
+                sample["time_feat_context"] = t_context
+                sample["nbr_feat_context"] = n_context
+                if aux_values is not None:
+                    sample["aux_context"] = aux_values[t - effective_context_history_len : t]
+            samples[h].append(sample)
 
     total = sum(len(v) for v in samples.values())
-    print(f"[build_samples] T={T} N={N} | samples per horizon: "
+    print(
+        f"[build_samples] T={T} N={N} stride={window_stride} "
+        f"recent_history={history_len} context_history={effective_context_history_len} | samples per horizon: "
           + ", ".join(f"h={h}:{len(samples[h])}" for h in horizons)
-          + f"  total={total}")
+          + f"  total={total}"
+    )
     return samples

@@ -1,0 +1,1 @@
+../projects/electric_load_forecasting/scripts/run_renewable_shared_dual_history.sh

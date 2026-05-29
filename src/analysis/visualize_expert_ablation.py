@@ -20,8 +20,8 @@ except ModuleNotFoundError:
 
 VARIANT_ORDER = ["wo_diffdora", "full", "wo_cot", "wo_rag", "wo_dora", "wo_moe", "base_model"]
 VARIANT_LABELS = {
-    "wo_diffdora": "Full",
-    "full": "w/o DiffDoRA",
+    "full": "Full",
+    "wo_diffdora": "w/o DiffDoRA",
     "wo_cot": "w/o CoT",
     "wo_rag": "w/o RAG",
     "wo_dora": "w/o DoRA",

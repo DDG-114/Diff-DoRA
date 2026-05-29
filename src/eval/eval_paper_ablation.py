@@ -22,15 +22,15 @@ from src.data.build_samples import build_samples
 from src.data.build_splits import build_splits
 from src.data.load_st_evcdp import load_st_evcdp
 from src.data.load_urbanev import load_urbanev
+from src.utils.history_window import price_at_history_end, weather_at_history_end
 from src.utils.node_context import extract_node_static_context, resolve_node_id
 from src.eval.diagnostics import compute_sequence_diagnostics
 from src.eval.metrics import per_horizon_metrics
-from src.models.diff_dora import DiffDoRAModel, set_diff_context
 from src.models.qwen_peft import load_model_and_tokenizer, load_peft_model, generate_batch
 from src.prompts.parser import parse_output
 from src.prompts.prompt_cot import build_cot_prompt
 from src.prompts.prompt_vanilla import build_direct_physical_prompt, build_vanilla_prompt
-from src.retrieval.diff_features import compute_diff_features, format_diff_block
+from src.retrieval.diff_features import compute_diff_features
 from src.retrieval.knn_retriever import KNNRetriever
 from src.routing.build_labels import build_routing_labels
 from src.routing.hard_router import HardRouter
@@ -45,10 +45,6 @@ def _load_dataset(dataset: str) -> dict:
 
 def _load_model(
     adapter_dir: str | None,
-    *,
-    use_diff_dora: bool,
-    diff_hidden_dim: int,
-    diff_scale: float,
 ):
     base_model, tokenizer = load_model_and_tokenizer()
     if adapter_dir:
@@ -62,25 +58,14 @@ def _load_model(
     if hasattr(model, "config"):
         model.config.use_cache = True
 
-    if not use_diff_dora:
-        return model, tokenizer, base_model
-
-    wrapped = DiffDoRAModel(
-        model,
-        diff_input_dim=3,
-        hidden_dim=diff_hidden_dim,
-        scale=diff_scale,
-    )
-    wrapped.to(next(model.parameters()).device)
     if adapter_dir:
         ctrl_path = Path(adapter_dir).parent / "diff_controller.pt"
         if ctrl_path.exists():
-            wrapped.controller.load_state_dict(torch.load(ctrl_path, map_location="cpu"))
-            wrapped.controller.to(next(model.parameters()).device)
-        else:
-            print(f"[WARN] Diff-DoRA controller not found for {adapter_dir}; using default wrapper weights.")
-    wrapped.eval()
-    return wrapped, tokenizer, base_model
+            print(
+                f"[WARN] Ignoring legacy Diff-DoRA controller checkpoint: {ctrl_path} "
+                "(paper-style Diff-DoRA is prompt-only now)."
+            )
+    return model, tokenizer, base_model
 
 
 def _cleanup_models(*objs):
@@ -101,53 +86,20 @@ def _resolve_prompt_style(prompt_style: str, has_retrieval: bool) -> str:
     return prompt_style
 
 
-def _weather_at(weather, t_start: int) -> dict | None:
-    if weather is None or getattr(weather, "empty", True):
-        return None
-    idx = min(max(int(t_start) + 11, 0), len(weather) - 1)
-    row = weather.iloc[idx]
-    if hasattr(row, "to_dict"):
-        d = row.to_dict()
-        for k in list(d.keys()):
-            lk = str(k).lower()
-            if "temp" in lk and "temperature" not in d:
-                d["temperature"] = d[k]
-            if "humid" in lk and "humidity" not in d:
-                d["humidity"] = d[k]
-        return d
-    return None
+def _weather_at(weather, sample: dict) -> dict | None:
+    return weather_at_history_end(weather, sample)
 
 
-def _price_at(price, t_start: int, node_idx: int, *, node_ids=None, node_meta=None) -> float | None:
-    if price is None or getattr(price, "empty", True):
-        return None
-    idx = min(max(int(t_start) + 11, 0), len(price) - 1)
-    row = price.iloc[idx]
-    node_id = resolve_node_id(node_idx, node_ids=node_ids, node_meta=node_meta)
-    if hasattr(row, "item") and not hasattr(row, "to_dict"):
-        return float(row.item())
-    if hasattr(row, "to_dict"):
-        d = row.to_dict()
-        if node_id in d:
-            return float(d[node_id])
-        if str(node_id) in d:
-            return float(d[str(node_id)])
-        if node_idx in d:
-            return float(d[node_idx])
-        if str(node_idx) in d:
-            return float(d[str(node_idx)])
-        vals = [float(v) for v in d.values() if v is not None]
-        if vals:
-            return float(sum(vals) / len(vals))
-    return None
+def _price_at(price, sample: dict, node_idx: int, *, node_ids=None, node_meta=None) -> float | None:
+    return price_at_history_end(price, sample, node_idx, node_ids=node_ids, node_meta=node_meta)
 
 
 def _compute_retrieval_diff(sample: dict, retrieved: list[dict], splits: dict, node_idx: int) -> dict:
-    weather_current = _weather_at(splits.get("weather"), sample.get("t_start", 0))
-    weather_retrieved = [_weather_at(splits.get("weather"), rs.get("t_start", 0)) for rs in retrieved]
+    weather_current = _weather_at(splits.get("weather"), sample)
+    weather_retrieved = [_weather_at(splits.get("weather"), rs) for rs in retrieved]
     price_current = _price_at(
         splits.get("price"),
-        sample.get("t_start", 0),
+        sample,
         node_idx,
         node_ids=splits.get("node_ids"),
         node_meta=splits.get("node_meta"),
@@ -155,7 +107,7 @@ def _compute_retrieval_diff(sample: dict, retrieved: list[dict], splits: dict, n
     price_retrieved = [
         _price_at(
             splits.get("price"),
-            rs.get("t_start", 0),
+            rs,
             node_idx,
             node_ids=splits.get("node_ids"),
             node_meta=splits.get("node_meta"),
@@ -173,16 +125,6 @@ def _compute_retrieval_diff(sample: dict, retrieved: list[dict], splits: dict, n
     )
 
 
-def _diff_tensor(diff: dict | None) -> torch.Tensor:
-    if diff is None:
-        return torch.zeros(3, dtype=torch.float32)
-    return torch.tensor([
-        float(diff.get("diff_occ", 0.0) or 0.0),
-        float(diff.get("diff_temp", 0.0) or 0.0),
-        float(diff.get("diff_price", 0.0) or 0.0),
-    ], dtype=torch.float32)
-
-
 def _build_prompt(
     *,
     sample: dict,
@@ -190,7 +132,9 @@ def _build_prompt(
     horizon: int,
     prompt_style: str,
     use_rag: bool,
+    use_diff_dora: bool,
     retriever: KNNRetriever | None,
+    retrieval_query_sample: dict | None = None,
     static_context: dict,
     domain_label: str,
     splits: dict,
@@ -198,10 +142,21 @@ def _build_prompt(
     retrieved = []
     diff = None
     if use_rag and retriever is not None:
-        retrieved = retriever.query(sample, exclude_t_start=None)
-        diff = _compute_retrieval_diff(sample, retrieved, splits, node_idx)
+        retrieval_query = retrieval_query_sample if retrieval_query_sample is not None else sample
+        retrieved = retriever.query(retrieval_query, exclude_t_start=None)
+        if not retrieved and retrieval_query_sample is not None:
+            # Fallback to the original sample view if the masked query fails to surface neighbours.
+            retrieved = retriever.query(sample, exclude_t_start=None)
+        if not retrieved and getattr(retriever, "pool", None):
+            # Last-resort fallback: use the first top-k entries from the retrieval pool so COT eval does not abort.
+            fallback_k = min(int(getattr(retriever, "top_k", 0) or 0), len(retriever.pool))
+            if fallback_k > 0:
+                retrieved = [retriever.pool[idx] for idx in range(fallback_k)]
+        if retrieved:
+            diff = _compute_retrieval_diff(sample, retrieved, splits, node_idx)
 
     resolved_style = _resolve_prompt_style(prompt_style, bool(retrieved) and diff is not None)
+    include_env_diff = use_diff_dora and resolved_style != "vanilla"
     if resolved_style == "cot":
         prompt = build_cot_prompt(
             sample,
@@ -211,16 +166,18 @@ def _build_prompt(
             horizon=horizon,
             domain_label=domain_label,
             static_context=static_context,
+            include_env_diff=include_env_diff,
         )
     elif resolved_style == "direct_physical":
         prompt = build_direct_physical_prompt(
             sample,
             retrieved,
-            format_diff_block(diff),
+            diff,
             node_idx=node_idx,
             horizon=horizon,
             domain_label=domain_label,
             static_context=static_context,
+            include_env_diff=include_env_diff,
         )
     else:
         prompt = build_vanilla_prompt(
@@ -230,12 +187,15 @@ def _build_prompt(
             domain_label=domain_label,
             static_context=static_context,
         )
-    return prompt, _diff_tensor(diff)
+    return prompt
 
 
 def _select_sample_subset(all_samples: list[dict], max_eval: int, sampling: str, seed: int):
     indexed = list(enumerate(all_samples))
-    count = min(max_eval, len(indexed))
+    if max_eval <= 0:
+        count = len(indexed)
+    else:
+        count = min(max_eval, len(indexed))
     if sampling == "random":
         rng = random.Random(seed)
         return rng.sample(indexed, count)
@@ -305,26 +265,11 @@ def evaluate_variant(
     }
 
     if variant_cfg["mode"] == "routed":
-        model_0, tokenizer, base_0 = _load_model(
-            variant_cfg["expert_0_dir"],
-            use_diff_dora=variant_cfg.get("use_diff_dora", False),
-            diff_hidden_dim=variant_cfg["diff_hidden_dim"],
-            diff_scale=variant_cfg["diff_scale"],
-        )
-        model_1, _, base_1 = _load_model(
-            variant_cfg["expert_1_dir"],
-            use_diff_dora=variant_cfg.get("use_diff_dora", False),
-            diff_hidden_dim=variant_cfg["diff_hidden_dim"],
-            diff_scale=variant_cfg["diff_scale"],
-        )
+        model_0, tokenizer, base_0 = _load_model(variant_cfg["expert_0_dir"])
+        model_1, _, base_1 = _load_model(variant_cfg["expert_1_dir"])
         models = {0: model_0, 1: model_1}
     else:
-        shared_model, tokenizer, shared_base = _load_model(
-            variant_cfg.get("adapter_dir"),
-            use_diff_dora=variant_cfg.get("use_diff_dora", False),
-            diff_hidden_dim=variant_cfg["diff_hidden_dim"],
-            diff_scale=variant_cfg["diff_scale"],
-        )
+        shared_model, tokenizer, shared_base = _load_model(variant_cfg.get("adapter_dir"))
         models = {"shared": shared_model}
 
     total_requested = len(subset) * len(node_indices)
@@ -341,12 +286,13 @@ def evaluate_variant(
                 node_ids=splits.get("node_ids"),
                 node_meta=splits.get("node_meta"),
             )
-            (sys_msg, usr_msg), diff_vec = _build_prompt(
+            sys_msg, usr_msg = _build_prompt(
                 sample=sample,
                 node_idx=node_idx,
                 horizon=horizon,
                 prompt_style=variant_cfg["prompt_style"],
                 use_rag=variant_cfg["use_rag"],
+                use_diff_dora=variant_cfg.get("use_diff_dora", False),
                 retriever=retriever,
                 static_context=static_context,
                 domain_label=domain_label,
@@ -359,7 +305,6 @@ def evaluate_variant(
                 "domain": domain_label,
                 "target": sample["y"][:horizon, node_idx],
                 "prompt": (sys_msg, usr_msg),
-                "diff_vec": diff_vec,
                 "sample_index": sample_offset,
                 "sample_dataset_index": sample_dataset_index,
                 "t_start": int(sample.get("t_start", -1)),
@@ -371,17 +316,12 @@ def evaluate_variant(
             model = models[model_key]
             for chunk in _batched(jobs, infer_batch_size):
                 prompts = [job["prompt"] for job in chunk]
-                if variant_cfg.get("use_diff_dora", False):
-                    batch_diff = torch.stack([job["diff_vec"] for job in chunk]).float()
-                    set_diff_context(batch_diff)
                 raw_outputs = generate_batch(
                     model,
                     tokenizer,
                     prompts,
                     max_new_tokens=max_new_tokens,
                 )
-                if variant_cfg.get("use_diff_dora", False):
-                    set_diff_context(None)
 
                 for job, raw_output in zip(chunk, raw_outputs):
                     total_done += 1
@@ -418,6 +358,8 @@ def evaluate_variant(
         "variant": variant_name,
         "mode": variant_cfg["mode"],
         "prompt_style": variant_cfg["prompt_style"],
+        "use_diff_dora": variant_cfg.get("use_diff_dora", False),
+        "diff_dora_impl": "prompt_only" if variant_cfg.get("use_diff_dora", False) else None,
         "max_new_tokens": max_new_tokens,
         "infer_batch_size": infer_batch_size,
         "requested_predictions": total_requested,
@@ -478,7 +420,14 @@ def main():
     parser.add_argument("--neighbor_k", type=int, default=7)
     parser.add_argument("--use_rag", action="store_true")
     parser.add_argument("--retrieval_cache", default="")
-    parser.add_argument("--max_eval", type=int, default=100)
+    parser.add_argument("--retrieval_device", default="cpu",
+                        help="Retrieval query backend: cpu, auto, or a CUDA device like cuda:0.")
+    parser.add_argument("--retrieval_query_batch_size", type=int, default=128,
+                        help="Number of query samples to score per retrieval batch when GPU retrieval is enabled.")
+    parser.add_argument("--retrieval_corpus_chunk_size", type=int, default=65536,
+                        help="Number of retrieval-bank vectors to compare per GPU retrieval chunk.")
+    parser.add_argument("--max_eval", type=int, default=100,
+                        help="Number of evaluation samples; <=0 evaluates the full split.")
     parser.add_argument("--max_nodes", type=int, default=0,
                         help="If >0, only evaluate the first N nodes when node_sampling=all.")
     parser.add_argument("--node_sampling", choices=["all", "balanced_random"], default="all")
@@ -488,8 +437,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--infer_batch_size", type=int, default=16)
-    parser.add_argument("--diff_hidden_dim", type=int, default=32)
-    parser.add_argument("--diff_scale", type=float, default=0.5)
 
     parser.add_argument("--full_expert_0_dir", default=None)
     parser.add_argument("--full_expert_1_dir", default=None)
@@ -542,6 +489,16 @@ def main():
                 f"Retrieval cache not found: {cache_path}. Build it first or pass --retrieval_cache."
             )
         retriever = KNNRetriever.load(cache_path)
+        retriever.configure_query_backend(
+            query_device=args.retrieval_device,
+            query_batch_size=args.retrieval_query_batch_size,
+            corpus_chunk_size=args.retrieval_corpus_chunk_size,
+        )
+        print(
+            f"[retrieval] query_device={retriever.resolved_query_device} "
+            f"query_batch_size={retriever.query_batch_size} "
+            f"corpus_chunk_size={retriever.corpus_chunk_size}"
+        )
 
     variants: list[tuple[str, dict]] = []
     if args.full_expert_0_dir and args.full_expert_1_dir:
@@ -552,8 +509,6 @@ def main():
             "prompt_style": "cot",
             "use_rag": args.use_rag,
             "use_diff_dora": True,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
     if args.wo_moe_dir:
         variants.append(("wo_moe", {
@@ -562,8 +517,6 @@ def main():
             "prompt_style": "cot",
             "use_rag": args.use_rag,
             "use_diff_dora": False,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
     if args.wo_cot_expert_0_dir and args.wo_cot_expert_1_dir:
         variants.append(("wo_cot", {
@@ -573,8 +526,6 @@ def main():
             "prompt_style": "direct_physical",
             "use_rag": args.use_rag,
             "use_diff_dora": True,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
     if args.wo_dora_expert_0_dir and args.wo_dora_expert_1_dir:
         variants.append(("wo_dora", {
@@ -584,8 +535,6 @@ def main():
             "prompt_style": "cot",
             "use_rag": args.use_rag,
             "use_diff_dora": False,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
     if args.wo_diffdora_expert_0_dir and args.wo_diffdora_expert_1_dir:
         variants.append(("wo_diffdora", {
@@ -595,8 +544,6 @@ def main():
             "prompt_style": "cot",
             "use_rag": args.use_rag,
             "use_diff_dora": False,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
     if args.wo_rag_expert_0_dir and args.wo_rag_expert_1_dir:
         variants.append(("wo_rag", {
@@ -605,9 +552,7 @@ def main():
             "expert_1_dir": args.wo_rag_expert_1_dir,
             "prompt_style": "vanilla",
             "use_rag": False,
-            "use_diff_dora": True,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
+            "use_diff_dora": False,
         }))
     if not args.skip_base_model:
         variants.append(("base_model", {
@@ -616,8 +561,6 @@ def main():
             "prompt_style": "cot",
             "use_rag": args.use_rag,
             "use_diff_dora": False,
-            "diff_hidden_dim": args.diff_hidden_dim,
-            "diff_scale": args.diff_scale,
         }))
 
     if not variants:
@@ -676,6 +619,7 @@ def main():
         "history_len": args.history_len,
         "neighbor_k": args.neighbor_k,
         "max_eval": args.max_eval,
+        "sample_scope": "full_split" if args.max_eval <= 0 else "subset",
         "max_nodes": args.max_nodes,
         "node_sampling": args.node_sampling,
         "max_nodes_per_domain": args.max_nodes_per_domain,

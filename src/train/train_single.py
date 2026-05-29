@@ -35,10 +35,11 @@ from transformers import (
     TrainingArguments,
 )
 
-from src.data.load_st_evcdp import load_st_evcdp
-from src.data.load_urbanev  import load_urbanev
+from src.data.loaders import DATASET_CHOICES, load_dataset
 from src.data.build_splits  import build_splits
 from src.data.build_samples import build_samples
+from src.utils.history_window import price_at_history_end, sample_history_end_index, weather_at_history_end
+from src.data.windowing import default_retrieval_cache_path, resolve_window_stride
 from src.utils.node_context import (
     extract_node_static_context,
     normalise_domain_label,
@@ -50,7 +51,9 @@ from src.prompts.prompt_vanilla import build_direct_physical_prompt, build_vanil
 from src.prompts.prompt_cot import build_cot_prompt, build_cot_target
 from src.prompts.parser     import parse_output
 from src.retrieval.knn_retriever import KNNRetriever
-from src.retrieval.diff_features import compute_diff_features, format_diff_block
+from src.retrieval.diff_features import compute_diff_features
+from src.retrieval.retrieval_result_cache import retrieval_result_cache_key
+from src.utils.price_candidate import combine_candidate_prediction
 
 
 # ─── Dataset wrapper ──────────────────────────────────────────────────────────
@@ -77,8 +80,11 @@ class EVDataset(Dataset):
         node_meta=None,
         node_ids: list[str] | None = None,
         poi=None,
-        include_diff_vec: bool = False,
+        include_env_diff: bool = False,
         prompt_style: str = "auto",
+        target_style: str = "auto",
+        retrieval_cache_entries: dict[str, dict] | None = None,
+        precomputed_retrieval_entries: dict[str, dict] | None = None,
     ):
         self.tokenizer = tokenizer
         self.horizon = horizon
@@ -91,31 +97,28 @@ class EVDataset(Dataset):
         self.node_meta = node_meta
         self.node_ids = node_ids
         self.poi = poi
-        self.include_diff_vec = include_diff_vec
+        self.include_env_diff = include_env_diff
+        self.retrieval_cache_entries = retrieval_cache_entries
+        self.precomputed_retrieval_entries = precomputed_retrieval_entries
         if prompt_style not in self.PROMPT_STYLES:
             raise ValueError(
                 f"Unsupported prompt_style={prompt_style!r}; expected one of {sorted(self.PROMPT_STYLES)}"
             )
         if prompt_style in {"cot", "direct_physical"} and not use_rag:
             raise ValueError(f"prompt_style={prompt_style!r} requires use_rag=True")
+        if include_env_diff and not use_rag:
+            raise ValueError("include_env_diff=True requires use_rag=True")
         self.prompt_style = prompt_style
+        if target_style not in {"auto", "numeric_only", "candidate_residual", "candidate_selective_residual", "candidate_chunk_offset"}:
+            raise ValueError("target_style must be one of: auto, numeric_only")
+        self.target_style = target_style
         self.items = self._build(samples)
 
-    def _weather_at(self, t_start: int) -> dict | None:
-        if self.weather is None or getattr(self.weather, "empty", True):
-            return None
-        idx = min(max(int(t_start) + 11, 0), len(self.weather) - 1)
-        row = self.weather.iloc[idx]
-        if hasattr(row, "to_dict"):
-            d = row.to_dict()
-            for k in list(d.keys()):
-                lk = str(k).lower()
-                if "temp" in lk and "temperature" not in d:
-                    d["temperature"] = d[k]
-                if "humid" in lk and "humidity" not in d:
-                    d["humidity"] = d[k]
-            return d
-        return None
+    def _history_end_index(self, sample: dict, frame) -> int:
+        return sample_history_end_index(sample, frame)
+
+    def _weather_at(self, sample: dict) -> dict | None:
+        return weather_at_history_end(self.weather, sample)
 
     def _node_id(self, sample_node_idx: int) -> str | int:
         return resolve_node_id(sample_node_idx, node_ids=self.node_ids, node_meta=self.node_meta)
@@ -127,28 +130,14 @@ class EVDataset(Dataset):
             node_meta=self.node_meta,
         )
 
-    def _price_at(self, t_start: int, sample_node_idx: int) -> float | None:
-        if self.price is None or getattr(self.price, "empty", True):
-            return None
-        idx = min(max(int(t_start) + 11, 0), len(self.price) - 1)
-        row = self.price.iloc[idx]
-        node_id = self._node_id(sample_node_idx)
-        if np.isscalar(row):
-            return float(row)
-        if hasattr(row, "to_dict"):
-            d = row.to_dict()
-            if node_id in d:
-                return float(d[node_id])
-            if str(node_id) in d:
-                return float(d[str(node_id)])
-            if sample_node_idx in d:
-                return float(d[sample_node_idx])
-            if str(sample_node_idx) in d:
-                return float(d[str(sample_node_idx)])
-            vals = [float(v) for v in d.values() if v is not None]
-            if vals:
-                return float(np.mean(vals))
-        return None
+    def _price_at(self, sample: dict, sample_node_idx: int) -> float | None:
+        return price_at_history_end(
+            self.price,
+            sample,
+            sample_node_idx,
+            node_ids=self.node_ids,
+            node_meta=self.node_meta,
+        )
 
     def _numeric_target(self, y: np.ndarray) -> str:
         return " [" + ", ".join(f"{v:.3f}" for v in y) + "]"
@@ -167,33 +156,45 @@ class EVDataset(Dataset):
         dropped_no_supervision = 0
         for s in samples:
             sample_node_idx = int(s.get("node_idx", self.node_idx))
-            diff_vec = np.zeros(3, dtype=np.float32)
             static_context = self._static_context(sample_node_idx)
             domain_label = normalise_domain_label(static_context.get("zone_type"))
             retrieved = []
             diff = None
             if self.use_rag and self.retriever is not None:
-                retrieved = self.retriever.query(s, exclude_t_start=s.get("t_start"))
-                weather_current = self._weather_at(s.get("t_start", 0))
-                weather_retrieved = [self._weather_at(rs.get("t_start", 0)) for rs in retrieved]
-                price_current = self._price_at(s.get("t_start", 0), sample_node_idx)
-                price_retrieved = [self._price_at(rs.get("t_start", 0), sample_node_idx) for rs in retrieved]
-                diff = compute_diff_features(
-                    query_sample=s,
-                    retrieved_samples=retrieved,
-                    weather_current=weather_current,
-                    weather_retrieved=weather_retrieved,
-                    price_current=price_current,
-                    price_retrieved=price_retrieved,
-                    node_idx=sample_node_idx,
-                )
-                diff_vec = np.array([
-                    float(diff.get("diff_occ", 0.0) or 0.0),
-                    float(diff.get("diff_temp", 0.0) or 0.0),
-                    float(diff.get("diff_price", 0.0) or 0.0),
-                ], dtype=np.float32)
+                cache_key = retrieval_result_cache_key(s, sample_node_idx)
+                cached = None
+                if self.precomputed_retrieval_entries is not None:
+                    cached = self.precomputed_retrieval_entries.get(cache_key)
+                if cached is None and self.retrieval_cache_entries is not None:
+                    cached = self.retrieval_cache_entries.get(cache_key)
+                if cached is not None:
+                    retrieved_idx = cached.get("retrieved_indices", [])
+                    retrieved = [self.retriever.pool[int(i)] for i in retrieved_idx]
+                    diff = cached.get("diff")
+                else:
+                    retrieved_idx = self.retriever.query_indices(s, exclude_t_start=s.get("t_start"))
+                    retrieved = [self.retriever.pool[int(i)] for i in retrieved_idx]
+                    weather_current = self._weather_at(s)
+                    weather_retrieved = [self._weather_at(rs) for rs in retrieved]
+                    price_current = self._price_at(s, sample_node_idx)
+                    price_retrieved = [self._price_at(rs, sample_node_idx) for rs in retrieved]
+                    diff = compute_diff_features(
+                        query_sample=s,
+                        retrieved_samples=retrieved,
+                        weather_current=weather_current,
+                        weather_retrieved=weather_retrieved,
+                        price_current=price_current,
+                        price_retrieved=price_retrieved,
+                        node_idx=sample_node_idx,
+                    )
+                    if self.retrieval_cache_entries is not None:
+                        self.retrieval_cache_entries[cache_key] = {
+                            "retrieved_indices": [int(i) for i in retrieved_idx],
+                            "diff": diff,
+                        }
 
             prompt_style = self._effective_prompt_style(bool(retrieved) and diff is not None)
+            include_env_diff = self.include_env_diff and prompt_style != "vanilla"
             if prompt_style == "cot":
                 sys_msg, usr_msg = build_cot_prompt(
                     s,
@@ -203,27 +204,60 @@ class EVDataset(Dataset):
                     horizon=self.horizon,
                     domain_label=domain_label,
                     static_context=static_context,
+                    include_env_diff=include_env_diff,
                 )
-                target = "\n" + build_cot_target(
+                y = s["y"][:self.horizon, sample_node_idx]
+                if self.target_style == "numeric_only":
+                    # The COT structure remains in the prompt; the supervised
+                    # response focuses the loss on the final forecast sequence.
+                    target = self._numeric_target(y)
+                else:
+                    target = "\n" + build_cot_target(
+                        s,
+                        retrieved,
+                        diff,
+                        node_idx=sample_node_idx,
+                        horizon=self.horizon,
+                        static_context=static_context,
+                        include_env_diff=include_env_diff,
+                    )
+            elif prompt_style == "direct_physical":
+                sys_msg, usr_msg = build_direct_physical_prompt(
                     s,
                     retrieved,
                     diff,
                     node_idx=sample_node_idx,
                     horizon=self.horizon,
-                    static_context=static_context,
-                )
-            elif prompt_style == "direct_physical":
-                sys_msg, usr_msg = build_direct_physical_prompt(
-                    s,
-                    retrieved,
-                    format_diff_block(diff),
-                    node_idx=sample_node_idx,
-                    horizon=self.horizon,
                     domain_label=domain_label,
                     static_context=static_context,
+                    include_env_diff=include_env_diff,
+                    target_mode=(
+                        "chunk_offset"
+                        if self.target_style == "candidate_chunk_offset"
+                        else (
+                        "selective_residual"
+                        if self.target_style == "candidate_selective_residual"
+                        else ("residual" if self.target_style == "candidate_residual" else "absolute")
+                        )
+                    ),
                 )
                 y = s["y"][:self.horizon, sample_node_idx]
-                target = self._numeric_target(y)
+                if self.target_style in {"candidate_residual", "candidate_selective_residual", "candidate_chunk_offset"}:
+                    candidate = s.get("candidate_future")
+                    if candidate is None:
+                        raise ValueError("candidate residual targets require candidate_future in samples.")
+                    residual = np.asarray(y, dtype=np.float32) - np.asarray(candidate[: self.horizon], dtype=np.float32)
+                    if self.target_style == "candidate_chunk_offset":
+                        residual = np.full_like(residual, float(np.mean(residual)))
+                    elif self.target_style == "candidate_selective_residual":
+                        mask = s.get("candidate_refine_mask")
+                        if mask is None:
+                            raise ValueError("candidate_selective_residual requires candidate_refine_mask in samples.")
+                        residual = residual * np.asarray(mask[: self.horizon], dtype=np.float32)
+                    residual = np.clip(residual, -0.2, 0.2)
+                    target = self._numeric_target(residual)
+                else:
+                    target = self._numeric_target(y)
             else:
                 sys_msg, usr_msg = build_vanilla_prompt(
                     s,
@@ -231,9 +265,33 @@ class EVDataset(Dataset):
                     self.horizon,
                     domain_label=domain_label,
                     static_context=static_context,
+                    target_mode=(
+                        "chunk_offset"
+                        if self.target_style == "candidate_chunk_offset"
+                        else (
+                        "selective_residual"
+                        if self.target_style == "candidate_selective_residual"
+                        else ("residual" if self.target_style == "candidate_residual" else "absolute")
+                        )
+                    ),
                 )
                 y = s["y"][:self.horizon, sample_node_idx]
-                target = self._numeric_target(y)
+                if self.target_style in {"candidate_residual", "candidate_selective_residual", "candidate_chunk_offset"}:
+                    candidate = s.get("candidate_future")
+                    if candidate is None:
+                        raise ValueError("candidate residual targets require candidate_future in samples.")
+                    residual = np.asarray(y, dtype=np.float32) - np.asarray(candidate[: self.horizon], dtype=np.float32)
+                    if self.target_style == "candidate_chunk_offset":
+                        residual = np.full_like(residual, float(np.mean(residual)))
+                    elif self.target_style == "candidate_selective_residual":
+                        mask = s.get("candidate_refine_mask")
+                        if mask is None:
+                            raise ValueError("candidate_selective_residual requires candidate_refine_mask in samples.")
+                        residual = residual * np.asarray(mask[: self.horizon], dtype=np.float32)
+                    residual = np.clip(residual, -0.2, 0.2)
+                    target = self._numeric_target(residual)
+                else:
+                    target = self._numeric_target(y)
 
             messages = [
                 {"role": "system", "content": sys_msg},
@@ -270,8 +328,6 @@ class EVDataset(Dataset):
                 "attention_mask": attention_mask,
                 "labels": labels,
             })
-            if self.include_diff_vec:
-                items[-1]["diff_vec"] = diff_vec.tolist()
 
         if not items:
             raise ValueError(
@@ -309,6 +365,7 @@ def run_inference(
     node_ids: list[str] | None = None,
     sampling: str = "head",
     seed: int = 42,
+    include_env_diff: bool = False,
 ):
     preds, trues = [], []
     if sampling == "random":
@@ -340,6 +397,7 @@ def run_inference(
                 horizon,
                 domain_label=domain_label,
                 static_context=static_context,
+                include_env_diff=include_env_diff,
             )
         else:
             sys_msg, usr_msg = build_vanilla_prompt(
@@ -361,7 +419,7 @@ def run_inference(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset",     default="st_evcdp", choices=["st_evcdp", "urbanev"])
+    parser.add_argument("--dataset",     default="st_evcdp", choices=DATASET_CHOICES)
     parser.add_argument("--horizon",     type=int, default=6)
     parser.add_argument("--node_idx",    type=int, default=0)
     parser.add_argument("--output_dir",  default="outputs/single_lora_h6")
@@ -378,6 +436,12 @@ def main():
                         help="Historical observation window; the paper uses 12.")
     parser.add_argument("--neighbor_k",  type=int, default=7,
                         help="Neighbour top-k used for spatial context; the paper uses 7.")
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=0,
+        help="Window step size. `0` means use `horizon` (non-overlapping targets); `1` keeps classic overlapping sliding windows.",
+    )
     parser.add_argument("--use_dora",    action="store_true")
     parser.add_argument("--use_rag",     action="store_true",
                         help="Enable retrieval-augmented CoT prompts")
@@ -403,13 +467,11 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    effective_window_stride = resolve_window_stride(args.window_stride, horizon=args.horizon)
 
     # 1. Load data
     print("Loading dataset …")
-    if args.dataset == "st_evcdp":
-        raw = load_st_evcdp()
-    else:
-        raw = load_urbanev()
+    raw = load_dataset(args.dataset)
     splits = build_splits(raw, args.dataset)
 
     # 2. Build samples
@@ -420,6 +482,7 @@ def main():
         horizons=[args.horizon],
         history_len=args.history_len,
         neighbor_k=args.neighbor_k,
+        window_stride=effective_window_stride,
     )
     test_samples_map = build_samples(
         splits["test"], splits["timestamps_test"],
@@ -427,6 +490,7 @@ def main():
         horizons=[args.horizon],
         history_len=args.history_len,
         neighbor_k=args.neighbor_k,
+        window_stride=effective_window_stride,
     )
     train_pool = train_samples_map[args.horizon]
     train_samples = train_pool[:args.max_samples]
@@ -438,7 +502,7 @@ def main():
         if args.retrieval_cache:
             cache_path = Path(args.retrieval_cache)
         else:
-            cache_path = Path(f"data/retrieval_cache/{args.dataset}_h{args.horizon}.pkl")
+            cache_path = default_retrieval_cache_path(args.dataset, args.horizon, effective_window_stride)
         if cache_path.exists():
             retriever = KNNRetriever.load(cache_path)
             print(f"Loaded retrieval cache: {cache_path}")

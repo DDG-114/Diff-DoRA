@@ -1,0 +1,1 @@
+../projects/electric_load_forecasting/scripts/run_train_eval_diffdora_strict.sh

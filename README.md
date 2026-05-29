@@ -20,7 +20,7 @@ pip install -r requirements.txt
 | P4 | RAG + diff features |
 | P5 | 3-stage CoT prompts |
 | P6 | Hard-routing MoE |
-| P7 | DoRA / Diff-DoRA |
+| P7 | DoRA + prompt-only Diff-DoRA |
 | P8 | Full / few / zero-shot experiments |
 | P9 | Reproduction report |
 
@@ -38,6 +38,7 @@ The training entry points now default to the paper's Table 4 settings:
 - `neighbor_k=7`
 
 Legacy quick-run outputs under `outputs/` may still reflect earlier exploratory settings.
+Older controller-gated Diff-DoRA artifacts are legacy and are not directly comparable to the current paper-aligned prompt-only implementation.
 
 ## Directory layout
 
@@ -47,7 +48,7 @@ src/
   data/           Data loading & sample building
   eval/           Metrics & evaluation scripts
   prompts/        Prompt templates & parser
-  models/         Model wrappers (PEFT, DoRA, Diff-DoRA)
+  models/         Model loading / PEFT / DoRA helpers
   train/          Training entry-points
   retrieval/      KNN retriever & diff features
   routing/        Label construction & hard router

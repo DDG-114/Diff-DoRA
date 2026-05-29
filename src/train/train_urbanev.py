@@ -28,6 +28,7 @@ from transformers import DataCollatorForSeq2Seq, Trainer, TrainingArguments
 from src.data.load_urbanev import load_urbanev
 from src.data.build_splits import build_splits
 from src.data.build_samples import build_samples
+from src.data.windowing import default_retrieval_cache_path, resolve_window_stride
 from src.eval.metrics import per_horizon_metrics
 from src.models.qwen_peft import load_model_and_tokenizer, get_lora_model
 from src.retrieval.knn_retriever import KNNRetriever
@@ -49,6 +50,12 @@ def main():
     parser.add_argument("--history_len", type=int, default=12)
     parser.add_argument("--retrieval_top_k", type=int, default=2)
     parser.add_argument("--neighbor_k", type=int, default=7)
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=0,
+        help="Window step size. `0` means use `horizon` (non-overlapping targets); `1` keeps classic overlapping sliding windows.",
+    )
 
     # Runtime knobs
     parser.add_argument("--batch_size", type=int, default=8)
@@ -70,6 +77,7 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    effective_window_stride = resolve_window_stride(args.window_stride, horizon=args.horizon)
 
     # 1) Data: UrbanEV (split = 8:1:1 in build_splits)
     print("Loading UrbanEV …")
@@ -85,6 +93,7 @@ def main():
         horizons=[args.horizon],
         history_len=args.history_len,
         neighbor_k=args.neighbor_k,
+        window_stride=effective_window_stride,
     )
     test_map = build_samples(
         splits["test"],
@@ -93,6 +102,7 @@ def main():
         horizons=[args.horizon],
         history_len=args.history_len,
         neighbor_k=args.neighbor_k,
+        window_stride=effective_window_stride,
     )
 
     train_samples = train_map[args.horizon]
@@ -104,7 +114,7 @@ def main():
     if args.retrieval_cache:
         cache_path = Path(args.retrieval_cache)
     else:
-        cache_path = Path(f"data/retrieval_cache/urbanev_h{args.horizon}.pkl")
+        cache_path = default_retrieval_cache_path("urbanev", args.horizon, effective_window_stride)
 
     if cache_path.exists():
         retriever = KNNRetriever.load(cache_path)

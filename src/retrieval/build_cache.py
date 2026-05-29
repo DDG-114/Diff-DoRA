@@ -16,25 +16,26 @@ import argparse
 import time
 from pathlib import Path
 
-from src.data.load_st_evcdp  import load_st_evcdp
-from src.data.load_urbanev   import load_urbanev
 from src.data.build_splits   import build_splits
 from src.data.build_samples  import build_samples
+from src.data.loaders import DATASET_LOADERS
+from src.data.windowing import default_retrieval_cache_path, resolve_window_stride
 from src.retrieval.knn_retriever import KNNRetriever
 
 CACHE_DIR = Path("data/retrieval_cache")
 
-LOADERS = {
-    "st_evcdp": load_st_evcdp,
-    "urbanev":  load_urbanev,
-}
 
-
-def build_and_save(dataset: str, horizon: int, output_path: Path | None = None) -> Path:
-    print(f"\n[build_cache] {dataset}  horizon={horizon}")
+def build_and_save(
+    dataset: str,
+    horizon: int,
+    *,
+    window_stride: int,
+    output_path: Path | None = None,
+) -> Path:
+    print(f"\n[build_cache] {dataset}  horizon={horizon}  window_stride={window_stride}")
     t0 = time.time()
 
-    raw    = LOADERS[dataset]()
+    raw    = DATASET_LOADERS[dataset]()
     splits = build_splits(raw, dataset)
 
     train_samples = build_samples(
@@ -42,13 +43,14 @@ def build_and_save(dataset: str, horizon: int, output_path: Path | None = None) 
         splits["timestamps_train"],
         adj=splits.get("adj"),
         horizons=[horizon],
+        window_stride=window_stride,
     )[horizon]
 
     print(f"  pool size = {len(train_samples)}")
 
     retriever = KNNRetriever(train_samples, top_k=2)
 
-    out_path = output_path or CACHE_DIR / f"{dataset}_h{horizon}.pkl"
+    out_path = output_path or default_retrieval_cache_path(dataset, horizon, window_stride)
     retriever.save(out_path)
 
     elapsed = time.time() - t0
@@ -59,8 +61,14 @@ def build_and_save(dataset: str, horizon: int, output_path: Path | None = None) 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datasets", nargs="+", default=["st_evcdp", "urbanev"])
+    parser.add_argument("--datasets", nargs="+", default=["st_evcdp", "urbanev"], choices=sorted(DATASET_LOADERS))
     parser.add_argument("--horizons", nargs="+", type=int, default=[3, 6, 9, 12])
+    parser.add_argument(
+        "--window_stride",
+        type=int,
+        default=0,
+        help="Window step size. `0` means use `horizon` (non-overlapping targets); `1` keeps classic overlapping sliding windows.",
+    )
     parser.add_argument(
         "--output_path",
         default="",
@@ -76,7 +84,13 @@ def main():
     for ds in args.datasets:
         for h in args.horizons:
             explicit_output = Path(args.output_path) if args.output_path else None
-            path = build_and_save(ds, h, output_path=explicit_output)
+            effective_window_stride = resolve_window_stride(args.window_stride, horizon=h)
+            path = build_and_save(
+                ds,
+                h,
+                window_stride=effective_window_stride,
+                output_path=explicit_output,
+            )
             saved.append(path)
 
     print(f"\n✅  Built {len(saved)} retrieval cache(s):")

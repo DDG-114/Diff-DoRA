@@ -14,6 +14,11 @@ STATIC_FIELD_ALIASES = {
     "area": ("area", "station_area"),
     "road_length": ("road_length", "road_len", "road"),
     "poi_summary": ("poi_summary", "poi", "poi_distribution"),
+    "site_type": ("site_type", "site_kind", "asset_type"),
+    "source_variant": ("source_variant",),
+    "coverage_ratio": ("coverage_ratio", "coverage"),
+    "unit": ("unit",),
+    "source_column": ("source_column",),
 }
 
 

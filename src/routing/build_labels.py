@@ -24,6 +24,10 @@ def build_labels_from_meta(node_meta: pd.DataFrame) -> np.ndarray | None:
     """
     if node_meta is None or node_meta.empty:
         return None
+    if "expert_id" in node_meta.columns:
+        labels = pd.to_numeric(node_meta["expert_id"], errors="coerce")
+        if labels.notna().all():
+            return labels.astype(np.int32).to_numpy()
     for col in ("zone_type", "type", "area_type", "category"):
         if col in node_meta.columns:
             raw = node_meta[col].astype(str).str.lower()
